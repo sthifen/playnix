@@ -446,6 +446,7 @@ fn menu_button(ui: &Rc<Ui>) -> gtk::MenuButton {
     menu.append(Some("Volver a conectar Google"), Some("win.google"));
     menu.append(Some("Ajustes de Android"), Some("win.android-settings"));
     menu.append(Some("Reparar instalación"), Some("win.repair"));
+    menu.append(Some("Copiar diagnóstico"), Some("win.diagnostics"));
 
     let fast = gio::SimpleAction::new_stateful("fast-start", None, &integrate::fast_start_enabled().to_variant());
     fast.connect_activate(|a, _| {
@@ -461,7 +462,21 @@ fn menu_button(ui: &Rc<Ui>) -> gtk::MenuButton {
     let u = ui.clone();
     let repair = gio::SimpleAction::new("repair", None);
     repair.connect_activate(move |_, _| u.show("welcome"));
-    for a in [&fast, &google, &settings, &repair] {
+    let w = ui.window.clone();
+    let diagnostics = gio::SimpleAction::new("diagnostics", None);
+    diagnostics.connect_activate(move |_, _| {
+        let w = w.clone();
+        background(android::diagnostics, move |text| {
+            w.clipboard().set_text(&text);
+            let d = adw::AlertDialog::builder()
+                .heading("Diagnóstico copiado")
+                .body("Pégalo en tu reporte del problema. No incluye tu cuenta ni tus apps.")
+                .build();
+            d.add_response("ok", "Entendido");
+            d.present(Some(&w));
+        });
+    });
+    for a in [&fast, &google, &settings, &repair, &diagnostics] {
         ui.window.add_action(a);
     }
     gtk::MenuButton::builder().icon_name("open-menu-symbolic").menu_model(&menu).build()

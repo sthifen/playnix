@@ -42,13 +42,16 @@ USER_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
 step deps "Instalando componentes del sistema"
 . /etc/os-release
 falta=0
-for c in waydroid git lzip python3 wl-copy debugfs; do command -v "$c" >/dev/null || falta=1; done
+# git y lzip solo hacen falta para Widevine (waydroid_script)
+extra=""; extra_apt=""
+[ "$WIDEVINE" = 1 ] && extra="git lzip" && extra_apt="git lzip python3-venv"
+for c in waydroid python3 wl-copy debugfs adb $extra; do command -v "$c" >/dev/null || falta=1; done
 if [ "$falta" = 1 ]; then
     info "Distribución: ${PRETTY_NAME:-$ID}"
     if command -v dnf >/dev/null; then
-        run dnf install -y waydroid git lzip python3 wl-clipboard e2fsprogs || fail "dnf no pudo instalar los paquetes"
+        run dnf install -y waydroid python3 wl-clipboard e2fsprogs android-tools $extra || fail "dnf no pudo instalar los paquetes"
     elif command -v rpm-ostree >/dev/null; then
-        run rpm-ostree install -y --idempotent waydroid git lzip wl-clipboard || fail "rpm-ostree falló"
+        run rpm-ostree install -y --idempotent waydroid wl-clipboard android-tools $extra || fail "rpm-ostree falló"
         fail "Se instalaron paquetes del sistema: reinicia la PC y vuelve a abrir Playnix."
     elif command -v apt-get >/dev/null; then
         if ! apt-cache policy waydroid 2>/dev/null | grep -q 'Candidate: [0-9]'; then
@@ -56,15 +59,15 @@ if [ "$falta" = 1 ]; then
             curl -fsSL https://repo.waydro.id | bash 2>&1 | sed -u 's/^/@@LOG /'
         fi
         run apt-get update
-        run apt-get install -y waydroid git lzip python3 python3-venv wl-clipboard e2fsprogs || fail "apt no pudo instalar los paquetes"
+        run apt-get install -y waydroid python3 wl-clipboard e2fsprogs adb $extra_apt || fail "apt no pudo instalar los paquetes"
     elif command -v pacman >/dev/null; then
-        run pacman -S --needed --noconfirm git lzip python wl-clipboard e2fsprogs || fail "pacman falló"
+        run pacman -S --needed --noconfirm python wl-clipboard e2fsprogs android-tools $extra || fail "pacman falló"
         command -v waydroid >/dev/null || run pacman -S --needed --noconfirm waydroid ||
             fail "En Arch instala 'waydroid' desde AUR (yay -S waydroid) y vuelve a abrir Playnix."
     elif command -v zypper >/dev/null; then
-        run zypper -n install waydroid git lzip python3 wl-clipboard e2fsprogs || fail "zypper falló"
+        run zypper -n install waydroid python3 wl-clipboard e2fsprogs android-tools $extra || fail "zypper falló"
     elif command -v xbps-install >/dev/null; then
-        run xbps-install -Sy waydroid git lzip python3 wl-clipboard e2fsprogs || fail "xbps falló"
+        run xbps-install -Sy waydroid python3 wl-clipboard e2fsprogs android-tools $extra || fail "xbps falló"
     else
         fail "No sé instalar paquetes en esta distribución. Instala waydroid a mano: https://docs.waydro.id"
     fi
@@ -141,32 +144,27 @@ if [ "$ARM" = auto ]; then
         GenuineIntel) ARM=houdini ;; *) ARM=ndk ;;
     esac
 fi
-# libhoudini es más compatible en Intel y libndk en AMD: si está la que no toca, se cambia
-actual=$(sed -n 's/^ro.dalvik.vm.native.bridge = lib\(houdini\|ndk_translation\)\.so$/\1/p' "$CFG" | head -1)
-[ "$actual" = ndk_translation ] && actual=ndk
-extras=() quitar=()
-if [ "$ARM" = none ] || [ "$actual" = "$ARM" ]; then
-    [ -n "$actual" ] && info "Traducción ARM: lib$actual"
-else
-    [ -n "$actual" ] && quitar+=("lib$actual") && info "Cambiando lib$actual por lib$ARM (mejor para tu CPU)"
-    extras+=("lib$ARM")
-fi
-[ "$WIDEVINE" = 1 ] && ! grep -q widevine "$CFG" && extras+=(widevine)
-if [ ${#extras[@]} -gt 0 ] || [ ${#quitar[@]} -gt 0 ]; then
+# libhoudini es más compatible en Intel y libndk en AMD. Se instala directo en el
+# overlay (data/arm-bridge.py); el zip queda en caché para cambiar sin descargar.
+# los avisos de descarga (stderr) salen al momento; stdout trae ok/changed
+{ r=$(python3 -I "$SRC_DIR/arm-bridge.py" "$ARM" 2>&3); } 3>&1 || fail "No se pudo instalar la traducción ARM"
+[ "$ARM" = none ] || info "Traducción ARM: lib$ARM"
+cambio=0
+echo "$r" | grep -qx changed && cambio=1
+
+# Widevine (opcional) sigue viniendo de waydroid_script
+if [ "$WIDEVINE" = 1 ] && ! grep -q widevine "$CFG"; then
     mkdir -p "$(dirname "$WS_DIR")"
     [ -d "$WS_DIR/.git" ] || run git clone -q --depth 1 https://github.com/casualsnek/waydroid_script "$WS_DIR" ||
         fail "No se pudo descargar waydroid_script"
     run git -C "$WS_DIR" pull -q --ff-only || true
     [ -x "$WS_DIR/venv/bin/python3" ] || run python3 -m venv "$WS_DIR/venv" || fail "No se pudo crear el entorno de Python"
     run "$WS_DIR/venv/bin/pip" install -q -r "$WS_DIR/requirements.txt" || fail "No se pudieron instalar dependencias de Python"
-    if [ ${#quitar[@]} -gt 0 ]; then
-        run "$WS_DIR/venv/bin/python3" "$WS_DIR/main.py" -a 13 uninstall "${quitar[@]}" || fail "No se pudo quitar ${quitar[*]}"
-    fi
-    if [ ${#extras[@]} -gt 0 ]; then
-        info "Instalando: ${extras[*]}"
-        run "$WS_DIR/venv/bin/python3" "$WS_DIR/main.py" -a 13 install "${extras[@]}" || fail "Falló la instalación de ${extras[*]}"
-    fi
+    info "Instalando: widevine"
+    run "$WS_DIR/venv/bin/python3" "$WS_DIR/main.py" -a 13 install widevine || fail "Falló la instalación de widevine"
+    cambio=0  # waydroid_script ya reinició Android
 fi
+[ "$cambio" = 1 ] && { run waydroid upgrade --offline || true; }
 
 # ---------------------------------------------------------------------------
 step helper "Integrando con el sistema"
@@ -175,6 +173,7 @@ install -D -m 644 "$SRC_DIR/io.github.sthifen.playnix.policy" /usr/share/polkit-
 info "Ayudante de permisos instalado"
 install -D -m 644 "$SRC_DIR/libpnxh.so" "$LIBEXEC/libpnxh.so"
 install -D -m 644 "$SRC_DIR/hwc-patch.py" "$LIBEXEC/hwc-patch.py"
+install -D -m 644 "$SRC_DIR/arm-bridge.py" "$LIBEXEC/arm-bridge.py"
 echo "@@LOG hwc-fix: $("$LIBEXEC/playnix-priv" hwc-fix)"
 
 echo "@@DONE"

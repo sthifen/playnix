@@ -100,6 +100,16 @@ case "${1:-}" in
         # Antes de arrancar Android: el overlay se monta al iniciar el contenedor
         hwc_fix
         ;;
+    adb-auth)
+        # Controles de teclado: Android acepta la llave adb del usuario que llama.
+        # Solo se copia una línea con forma de llave pública (base64 y comentario).
+        home=$(getent passwd "${PKEXEC_UID:-${SUDO_UID:-}}" | cut -d: -f6)
+        key=$(head -n1 "$home/.android/adbkey.pub" 2>/dev/null | head -c 4096)
+        [[ "$key" =~ ^[A-Za-z0-9+/=]+( [A-Za-z0-9@._-]+)?$ ]] || { echo "llave adb inválida" >&2; exit 1; }
+        waydroid shell -- sh -c "f=/data/misc/adb/adb_keys; mkdir -p /data/misc/adb
+            grep -qxF '$key' \$f 2>/dev/null || echo '$key' >> \$f
+            chown system:shell \$f; chmod 640 \$f"
+        ;;
     android-id)
         waydroid shell -- sh -c "sqlite3 /data/data/com.google.android.gsf/databases/gservices.db \"select value from main where name = 'android_id';\"" 2>/dev/null | tr -dc '0-9'
         ;;
@@ -135,7 +145,7 @@ case "${1:-}" in
             rm -rf "$d"'
         ;;
     *)
-        echo "uso: playnix-priv gpu-detect|gpu-auto|hwc-fix|android-id|setup-android|restart-container|install-split" >&2
+        echo "uso: playnix-priv gpu-detect|gpu-auto|hwc-fix|adb-auth|android-id|setup-android|restart-container|install-split" >&2
         exit 2
         ;;
 esac

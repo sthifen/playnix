@@ -14,6 +14,7 @@ const PRIV_HELPER: &str = include_str!("../data/playnix-priv");
 const POLICY: &str = include_str!("../data/io.github.sthifen.playnix.policy");
 const HWC_SHIM: &[u8] = include_bytes!("../data/hwc-fix/libpnxh.so");
 const HWC_PATCH: &str = include_str!("../data/hwc-fix/hwc-patch.py");
+const ARM_BRIDGE: &str = include_str!("../data/arm-bridge.py");
 
 #[derive(Debug, Clone)]
 pub enum Ev {
@@ -51,6 +52,7 @@ fn stage_scripts() -> Res<PathBuf> {
         ("io.github.sthifen.playnix.policy", POLICY.as_bytes(), 0o644),
         ("libpnxh.so", HWC_SHIM, 0o644),
         ("hwc-patch.py", HWC_PATCH.as_bytes(), 0o644),
+        ("arm-bridge.py", ARM_BRIDGE.as_bytes(), 0o644),
     ] {
         let p = dir.join(name);
         std::fs::write(&p, content).map_err(|e| e.to_string())?;

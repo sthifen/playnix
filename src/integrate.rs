@@ -56,19 +56,50 @@ pub fn bin_path() -> PathBuf {
     dirs_home().join(".local/bin/playnix")
 }
 
-/// Copia Playnix (el AppImage o el binario) a ~/.local/bin/playnix para que los
-/// accesos del menú sigan funcionando aunque se borre el archivo descargado.
+/// Donde queda el AppImage extraído.
+fn app_dir() -> PathBuf {
+    dirs_home().join(".local/lib/playnix")
+}
+
+/// Instala Playnix en ~/.local/bin/playnix para que los accesos del menú sigan
+/// funcionando aunque se borre el archivo descargado. El AppImage se extrae: así no
+/// hace falta FUSE y cada app abre sin montar la imagen.
 pub fn install_self() -> Result<(), String> {
-    let src = std::env::var_os("APPIMAGE")
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_exe().ok())
-        .ok_or("no encuentro el ejecutable de Playnix")?;
     let dst = bin_path();
-    if src != dst {
-        std::fs::create_dir_all(dst.parent().unwrap()).map_err(|e| e.to_string())?;
-        let tmp = dst.with_extension("new");
-        std::fs::copy(&src, &tmp).map_err(|e| format!("copiando Playnix: {e}"))?;
+    std::fs::create_dir_all(dst.parent().unwrap()).map_err(|e| e.to_string())?;
+    let tmp = dst.with_extension("new");
+    let _ = std::fs::remove_file(&tmp);
+    if let Some(appimage) = std::env::var_os("APPIMAGE").map(PathBuf::from) {
+        let base = app_dir();
+        let (work, old) = (base.with_extension("new"), base.with_extension("old"));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+        let ok = Command::new(&appimage)
+            .arg("--appimage-extract")
+            .current_dir(&work)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            let _ = std::fs::remove_dir_all(&work);
+            return Err("no se pudo extraer Playnix".into());
+        }
+        let _ = std::fs::remove_dir_all(&old);
+        if base.exists() {
+            std::fs::rename(&base, &old).map_err(|e| e.to_string())?;
+        }
+        std::fs::rename(work.join("squashfs-root"), &base).map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_dir_all(&work);
+        let _ = std::fs::remove_dir_all(&old);
+        std::os::unix::fs::symlink(base.join("AppRun"), &tmp).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &dst).map_err(|e| e.to_string())?;
+    } else {
+        let src = std::env::current_exe().map_err(|_| "no encuentro el ejecutable de Playnix")?;
+        // ya corre desde lo instalado (p. ej. reinstalar desde el menú)
+        if src != dst && !src.starts_with(app_dir()) {
+            std::fs::copy(&src, &tmp).map_err(|e| format!("copiando Playnix: {e}"))?;
+            std::fs::rename(&tmp, &dst).map_err(|e| e.to_string())?;
+        }
     }
     let icon = dirs_home().join(".local/share/icons/hicolor/scalable/apps/playnix.svg");
     std::fs::create_dir_all(icon.parent().unwrap()).map_err(|e| e.to_string())?;

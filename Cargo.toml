@@ -10,6 +10,10 @@ repository = "https://github.com/sthifen/playnix"
 adw = { version = "0.9.2", package = "libadwaita", features = ["v1_5"] }
 async-channel = "2.5.0"
 gtk = { version = "0.11.5", package = "gtk4", features = ["v4_14"] }
+pangocairo = "0.22"
+serde_json = "1"
+wayland-client = { version = "0.31", features = ["system"] }
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 
 [profile.release]
 lto = true

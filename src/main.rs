@@ -7,10 +7,14 @@
 //!   playnix uninstall <paquete>  confirmar y desinstalar una app
 //!   playnix integrate            reaplicar la integración con el menú
 //!   playnix watchdog             reinicia Android si su pantalla se cae (servicio)
+//!   playnix diagnose             resumen para reportar un problema
+//!   playnix controls <paquete> <perfil.json> | --gestos | --quitar
+//!                                controles de teclado para un juego
 
 mod android;
 mod apk;
 mod cli;
+mod controls;
 mod integrate;
 mod setup;
 mod ui_apps;
@@ -48,13 +52,37 @@ fn run_gui(mode: Mode) -> gtk::glib::ExitCode {
             Mode::Uninstall(pkg) => ui_apps::uninstall(app, pkg),
         }
     });
+    // Depuración: PLAYNIX_SNAPSHOT=/ruta/base guarda cada ventana como PNG a los 3 s
+    if let Some(base) = std::env::var_os("PLAYNIX_SNAPSHOT") {
+        let base = PathBuf::from(base);
+        app.connect_startup(move |app| {
+            let (app, base) = (app.clone(), base.clone());
+            gtk::glib::timeout_add_seconds_local_once(3, move || {
+                for (i, w) in app.windows().iter().enumerate() {
+                    let path = base.with_file_name(format!(
+                        "{}-{i}.png",
+                        base.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                    let paintable = gtk::WidgetPaintable::new(Some(w));
+                    let snap = gtk::Snapshot::new();
+                    paintable.snapshot(&snap, w.width() as f64, w.height() as f64);
+                    let renderer = w.native().and_then(|n| n.renderer());
+                    if let (Some(node), Some(r)) = (snap.to_node(), renderer) {
+                        let _ = r.render_texture(&node, None).save_to_png(&path);
+                        eprintln!("playnix: ventana guardada en {}", path.display());
+                    }
+                }
+            });
+        });
+    }
     app.run_with_args::<&str>(&[])
 }
 
 fn usage() -> ! {
     eprintln!(
         "uso: playnix [--cli [--yes] [--gpu=auto|hw|sw] [--widevine] [--reinit] [--fast-start]]\n\
-         \x20      playnix open <paquete> | install-apk <archivo.apk> | uninstall <paquete> | integrate"
+         \x20      playnix open <paquete> | install-apk <archivo.apk> | uninstall <paquete> | integrate\n\
+         \x20      playnix controls <paquete> <perfil.json> | --gestos | --quitar"
     );
     std::process::exit(2)
 }
@@ -82,7 +110,7 @@ fn main() -> gtk::glib::ExitCode {
             if apk::is_bundle(&p) { apk::read_bundle(&p) } else { apk::read(&p) }
         } {
             Some(i) => {
-                println!("paquete: {}\nversión: {}\nnombre:  {}", i.package, i.version, i.label);
+                println!("paquete: {}\nversión: {}\nnombre:  {}\njuego:   {}", i.package, i.version, i.label, if i.game { "sí" } else { "no" });
                 gtk::glib::ExitCode::SUCCESS
             }
             None => {
@@ -90,6 +118,41 @@ fn main() -> gtk::glib::ExitCode {
                 gtk::glib::ExitCode::FAILURE
             }
         },
+        Some("controls") => {
+            let pkg = arg(1);
+            match arg(2).as_str() {
+                "--gestos" => match controls::enable_gestures(&pkg) {
+                    Ok(()) => {
+                        println!("Gestos del mouse activos en {pkg} (F1 dentro de la app para agregar controles)");
+                        gtk::glib::ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("playnix: {e}");
+                        gtk::glib::ExitCode::FAILURE
+                    }
+                },
+                "--quitar" => {
+                    if controls::remove(&pkg) {
+                        println!("Controles de {pkg} quitados");
+                    }
+                    gtk::glib::ExitCode::SUCCESS
+                }
+                file => match controls::import(&pkg, std::path::Path::new(file)) {
+                    Ok(n) => {
+                        println!("{n} controles listos para {pkg}: se activan al abrir el juego");
+                        gtk::glib::ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("playnix: {e}");
+                        gtk::glib::ExitCode::FAILURE
+                    }
+                },
+            }
+        }
+        Some("diagnose") => {
+            print!("{}", android::diagnostics());
+            gtk::glib::ExitCode::SUCCESS
+        }
         Some("watchdog") => integrate::watchdog(),
         Some("--version") => {
             println!("playnix {}", env!("CARGO_PKG_VERSION"));

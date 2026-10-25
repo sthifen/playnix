@@ -2,6 +2,7 @@
 
 use crate::android;
 use crate::apk;
+use crate::controls;
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use std::path::PathBuf;
@@ -56,6 +57,7 @@ pub fn open(app: &adw::Application, pkg: String) {
     if android::session_running() {
         android::unfreeze();
         android::launch(&pkg);
+        with_controls(app, pkg);
         return;
     }
     let name = android::app_name(&pkg);
@@ -71,7 +73,7 @@ pub fn open(app: &adw::Application, pkg: String) {
     win.set_default_height(320);
     win.present();
 
-    let w = win.clone();
+    let (w, a, p) = (win.clone(), app.clone(), pkg.clone());
     background(
         move || {
             android::ensure_session(Duration::from_secs(150))?;
@@ -81,7 +83,10 @@ pub fn open(app: &adw::Application, pkg: String) {
             Ok::<_, String>(())
         },
         move |r| match r {
-            Ok(()) => w.close(),
+            Ok(()) => {
+                with_controls(&a, p);
+                w.close();
+            }
             Err(e) => {
                 page.set_title("No se pudo abrir");
                 page.set_description(Some(&format!("{e}. Inténtalo de nuevo o abre Playnix para repararlo.")));
@@ -89,6 +94,40 @@ pub fn open(app: &adw::Application, pkg: String) {
             }
         },
     );
+}
+
+/// Pone la capa de controles encima de los juegos (con sus teclas si tienen perfil;
+/// sin perfil, los gestos del mouse) y de cualquier app con perfil.
+fn with_controls(app: &adw::Application, pkg: String) {
+    let profile = controls::load(&pkg);
+    let hold = app.hold();
+    let a = app.clone();
+    background(
+        {
+            let pkg = pkg.clone();
+            move || profile.or_else(|| controls::is_game(&pkg).then(controls::profile::Profile::empty))
+        },
+        move |profile| {
+            drop(hold);
+            if let Some(profile) = profile {
+                start_controls(&a, pkg, profile);
+            }
+        },
+    );
+}
+
+fn start_controls(app: &adw::Application, pkg: String, profile: controls::profile::Profile) {
+    let a = app.clone();
+    controls::start(app, pkg.clone(), profile, move |e| {
+        let page = adw::StatusPage::builder()
+            .icon_name("input-keyboard-symbolic")
+            .title("Los controles de teclado no se activaron")
+            .description(format!("{e}. El juego sigue abierto; puedes jugar con el mouse."))
+            .build();
+        page.add_css_class("compact");
+        let win = small_window(&a, &android::app_name(&pkg), &page);
+        win.present();
+    });
 }
 
 // --- Instalar un APK ------------------------------------------------------------

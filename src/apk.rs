@@ -9,6 +9,8 @@ pub struct ApkInfo {
     pub package: String,
     pub version: String,
     pub label: String,
+    /// La app se declara juego (`android:isGame` o `android:appCategory="game"`).
+    pub game: bool,
 }
 
 fn u16_at(d: &[u8], p: usize) -> Option<u16> {
@@ -124,6 +126,8 @@ fn string_pool(d: &[u8], off: usize) -> Option<Vec<String>> {
 pub fn read(path: &Path) -> Option<ApkInfo> {
     let d = read_manifest(path)?;
     let mut strings = Vec::new();
+    // ID de recurso de cada nombre de atributo (algunos APK dejan el nombre vacío)
+    let mut res_ids: Vec<u32> = Vec::new();
     let mut info = ApkInfo::default();
     let mut pos = 8;
     while pos + 8 <= d.len() {
@@ -134,6 +138,8 @@ pub fn read(path: &Path) -> Option<ApkInfo> {
         }
         if ctype == 0x0001 {
             strings = string_pool(&d, pos)?;
+        } else if ctype == 0x0180 {
+            res_ids = (pos + 8..pos + csize).step_by(4).filter_map(|p| u32_at(&d, p)).collect();
         } else if ctype == 0x0102 {
             let ext = pos + 16;
             let name = strings.get(u32_at(&d, ext + 4)? as usize).cloned().unwrap_or_default();
@@ -143,9 +149,20 @@ pub fn read(path: &Path) -> Option<ApkInfo> {
             for i in 0..acount {
                 let a = ext + astart + i * asize;
                 let key = strings.get(u32_at(&d, a + 4)? as usize).cloned().unwrap_or_default();
+                let key_idx = u32_at(&d, a + 4)? as usize;
                 let raw = u32_at(&d, a + 8)?;
                 let dtype = *d.get(a + 15)?;
                 let val = u32_at(&d, a + 16)?;
+                if name == "application" {
+                    let id = res_ids.get(key_idx).copied().unwrap_or(0);
+                    // isGame: booleano (0x12); appCategory: entero (0x10/0x11), game = 0
+                    if (key == "isGame" || id == 0x0101_03f4) && dtype == 0x12 && val != 0 {
+                        info.game = true;
+                    }
+                    if (key == "appCategory" || id == 0x0101_0545) && (dtype == 0x10 || dtype == 0x11) && val == 0 {
+                        info.game = true;
+                    }
+                }
                 let s = if raw != u32::MAX {
                     strings.get(raw as usize).cloned()
                 } else if dtype == 3 {
@@ -216,7 +233,7 @@ else:
         let _ = std::fs::remove_file(tmp);
         return info;
     }
-    (!pkg.is_empty()).then(|| ApkInfo { package: pkg.into(), version: ver.into(), label: name.into() })
+    (!pkg.is_empty()).then(|| ApkInfo { package: pkg.into(), version: ver.into(), label: name.into(), game: false })
 }
 
 /// Extrae los .apk (y los OBB) de un paquete partido en `dest`.

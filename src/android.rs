@@ -259,6 +259,49 @@ pub fn dirs_home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()))
 }
 
+/// Resumen para reportar un problema: versiones, estado y el final del log de
+/// Waydroid. Sin datos personales (ni cuenta de Google ni lista de apps).
+pub fn diagnostics() -> String {
+    let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+    let os = read("/etc/os-release")
+        .lines()
+        .find_map(|l| l.strip_prefix("PRETTY_NAME=").map(|v| v.trim_matches('"').to_string()))
+        .unwrap_or_default();
+    let cfg = read("/var/lib/waydroid/waydroid.cfg");
+    let props: Vec<&str> = cfg
+        .lines()
+        .skip_while(|l| l.trim() != "[properties]")
+        .skip(1)
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    let log = read("/var/lib/waydroid/waydroid.log");
+    // sin los sondeos de estado (lxc-info y sus respuestas RUNNING/FROZEN…)
+    let tail: Vec<&str> = log
+        .lines()
+        .filter(|l| !l.contains("lxc-info") && !["RUNNING", "STOPPED", "FROZEN"].iter().any(|s| l.ends_with(&format!("] {s}"))))
+        .collect();
+    let tail = &tail[tail.len().saturating_sub(40)..];
+    let c = run_checks();
+    format!(
+        "Playnix {}\nSistema: {os}\nKernel: {}\nSesión: {} ({})\nBinder: {}\nWaydroid: {}\n\
+         Estado: {}\nGPU elegida: {}  ·  NVIDIA principal: {}\nTraducción ARM: {}\n\
+         Arreglo de capas (hwc-fix): {}\n\n[properties]\n{}\n\nwaydroid.log (final):\n{}\n",
+        env!("CARGO_PKG_VERSION"),
+        output("uname", &["-r"]).trim(),
+        std::env::var("XDG_SESSION_TYPE").unwrap_or_default(),
+        std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
+        if c.binder { "sí" } else { "no" },
+        output("waydroid", &["--version"]).trim(),
+        output("waydroid", &["status"]).trim().replace('\n', " · ").replace('\t', " "),
+        read("/var/lib/playnix/gpu-mode").trim(),
+        if c.nvidia_primary { "sí" } else { "no" },
+        cfg.lines().find_map(|l| l.strip_prefix("ro.dalvik.vm.native.bridge = ")).unwrap_or("ninguna"),
+        if Path::new("/var/lib/waydroid/overlay/vendor/lib64/libpnxh.so").exists() { "activo" } else { "no" },
+        props.join("\n"),
+        tail.join("\n"),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Comprobaciones del equipo
 
@@ -303,14 +346,23 @@ fn nvidia_primary() -> bool {
     let mut mesa = false;
     let mut nv = false;
     if let Ok(rd) = std::fs::read_dir("/sys/class/drm") {
+        mesa = rd.flatten().any(|e| {
+            e.file_name().to_string_lossy().starts_with("renderD")
+                && ["i915", "xe", "amdgpu", "radeon", "nouveau"].contains(&driver(e.path()).as_str())
+        });
+    }
+    if !mesa {
+        return true;
+    }
+    // Lo que manda es la GPU que el compositor tiene abierta ahora (corre como el
+    // usuario, así que se puede mirar sin root); las reglas fijas son el respaldo.
+    if let Some(dev) = compositor_gpu() {
+        return driver(PathBuf::from("/sys/class/drm").join(dev)) == "nvidia";
+    }
+    if let Ok(rd) = std::fs::read_dir("/sys/class/drm") {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             let drv = driver(e.path());
-            if name.starts_with("renderD")
-                && ["i915", "xe", "amdgpu", "radeon", "nouveau"].contains(&drv.as_str())
-            {
-                mesa = true;
-            }
             if name.starts_with("card") && !name.contains('-') && drv == "nvidia" {
                 let boot = std::fs::read_to_string(e.path().join("device/boot_vga")).unwrap_or_default();
                 nv |= boot.trim() == "1";
@@ -323,5 +375,29 @@ fn nvidia_primary() -> bool {
             nv |= s.contains("mutter-device-preferred-primary") && s.contains("0x10de");
         }
     }
-    !mesa || nv
+    nv
+}
+
+/// Dispositivo DRM (card0, renderD128…) con más descriptores abiertos por el
+/// compositor: el que usa para dibujar. Mismo criterio que `playnix-priv gpu-detect`.
+fn compositor_gpu() -> Option<String> {
+    const NAMES: &[&str] = &[
+        "gnome-shell", "kwin_wayland", "Hyprland", "sway", "cosmic-comp", "niri", "wayfire", "labwc",
+        "weston", "river", "mutter",
+    ];
+    let mut counts: std::collections::HashMap<String, usize> = Default::default();
+    for p in std::fs::read_dir("/proc").ok()?.flatten() {
+        let comm = std::fs::read_to_string(p.path().join("comm")).unwrap_or_default();
+        if !NAMES.contains(&comm.trim()) {
+            continue;
+        }
+        for fd in std::fs::read_dir(p.path().join("fd")).into_iter().flatten().flatten() {
+            if let Ok(t) = std::fs::read_link(fd.path()) {
+                if let Some(dev) = t.to_str().and_then(|t| t.strip_prefix("/dev/dri/")) {
+                    *counts.entry(dev.to_string()).or_default() += 1;
+                }
+            }
+        }
+    }
+    counts.into_iter().max_by_key(|(_, n)| *n).map(|(d, _)| d)
 }

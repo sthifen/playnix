@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 # Construye Playnix-x86_64.AppImage dentro de un contenedor Ubuntu 24.04, para que
 # el binario use una glibc antigua y funcione en casi cualquier distro moderna.
+# Incluye GTK4 y libadwaita (packaging/bundle-libs.sh): no hace falta instalarlas.
 # Requisitos: podman (o docker). Resultado: dist/Playnix-x86_64.AppImage
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 ENGINE=$(command -v podman || command -v docker) || { echo "Necesito podman o docker" >&2; exit 1; }
-IMAGE=playnix-builder:24.04
+IMAGE=playnix-builder:24.04-2
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)
 
 if ! "$ENGINE" image exists "$IMAGE" 2>/dev/null && ! "$ENGINE" image inspect "$IMAGE" >/dev/null 2>&1; then
     "$ENGINE" build -t "$IMAGE" -f - "$ROOT/packaging" <<'EOF'
 FROM docker.io/library/ubuntu:24.04
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        curl ca-certificates build-essential pkg-config libgtk-4-dev libadwaita-1-dev file desktop-file-utils \
+        curl ca-certificates build-essential pkg-config libgtk-4-dev libadwaita-1-dev file desktop-file-utils patchelf \
     && rm -rf /var/lib/apt/lists/*
 RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
 RUN curl -fsSL -o /usr/local/bin/appimagetool \
@@ -28,6 +29,9 @@ mkdir -p "$ROOT/dist"
     CARGO_TARGET_DIR=/src/target/appimage cargo build --release --locked
     APPDIR=$(mktemp -d)/Playnix.AppDir
     install -Dm755 target/appimage/release/playnix "$APPDIR/usr/bin/playnix"
+    packaging/bundle-libs.sh "$APPDIR"
+    install -Dm644 LICENSE "$APPDIR/usr/share/doc/playnix/LICENSE"
+    install -Dm644 data/controls/scrcpy-LICENSE "$APPDIR/usr/share/doc/playnix/scrcpy-LICENSE"
     install -Dm644 data/playnix.svg "$APPDIR/usr/share/icons/hicolor/scalable/apps/playnix.svg"
     cp data/playnix.svg "$APPDIR/playnix.svg"
     ln -s playnix.svg "$APPDIR/.DirIcon"
