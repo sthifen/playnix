@@ -223,6 +223,7 @@ void *split_layer_name(void *ret, const lstr *name) {
 #define XDG_SURFACE_DESTROY 0
 #define XDG_SURFACE_SET_WINDOW_GEOMETRY 3
 #define XDG_TOPLEVEL_DESTROY 0
+#define XDG_TOPLEVEL_SET_APP_ID 3
 #define XDG_TOPLEVEL_MOVE 5
 #define XDG_TOPLEVEL_SET_MAX_SIZE 7
 #define XDG_TOPLEVEL_SET_MIN_SIZE 8
@@ -266,6 +267,8 @@ static struct {
     int gx, gy, gw, gh;  // geometría enviada (gw = 0: todavía no se conoce)
     int fixed;           // tamaño mínimo y máximo puestos
     int full;            // la app ocupa toda la pantalla de Android (-1: no se sabe)
+    struct wl_proxy *surface;  // su wl_surface principal
+    char app_id[160];          // "waydroid.<paquete>"
 } wins[WINDOWS];
 static unsigned next_win;
 // Ventana con el foco del teclado: la que se acaba de clicar
@@ -297,6 +300,34 @@ static int slot_of_region(struct wl_proxy *r, int create) {
     regions[i].valid = 0;
     return i;
 }
+
+// Controles dentro de la ventana (al final del archivo); eventos para Playnix
+#define EV_SIZE 1
+#define EV_MOTION 2
+#define EV_BUTTON 3
+#define EV_AXIS 4
+#define EV_KEY 5
+#define EV_MODS 6
+#define EV_REL 7
+#define EV_LEAVE 8
+#define EV_ENTER 9
+#define EV_FOCUS 10
+#define EV_GONE 11
+struct ctl;
+static struct ctl *pointer_ctl;
+static struct ctl *ctl_of_surface(struct wl_proxy *surface);
+static void ctl_pointer(struct ctl *c, unsigned type, const int *v, unsigned n);
+static int ctl_key(unsigned key, unsigned state);
+static void ctl_mods(const int *v);
+static void ctl_focus(void *window, int on);
+static void ctl_window_updated(int i);
+static void ctl_window_gone(void *window);
+static void ctl_start(uintptr_t caller);
+static void ctl_cursor(unsigned serial);
+static unsigned cursor_serial;
+static void registry_global(void *, struct wl_proxy *, unsigned, const char *, unsigned);
+static fnptr registry_orig[LISTENER_SLOTS], registry_wrap[LISTENER_SLOTS];
+static struct wl_proxy *pointer_proxy;
 
 static int prop_int(const char *name, int def) {
     char v[92];
@@ -359,15 +390,30 @@ static fnptr keyboard_orig[LISTENER_SLOTS], keyboard_wrap[LISTENER_SLOTS];
 
 static void keyboard_enter(void *data, struct wl_proxy *kb, unsigned serial, struct wl_proxy *surface, struct wl_array *keys) {
     focused = surface ? get_user_data(surface) : 0;
+    ctl_focus(focused, 1);
     ((void (*)(void *, struct wl_proxy *, unsigned, struct wl_proxy *, struct wl_array *))keyboard_orig[1])(data, kb, serial, surface, keys);
 }
 
 static void keyboard_leave(void *data, struct wl_proxy *kb, unsigned serial, struct wl_proxy *surface) {
+    ctl_focus(focused, 0);
     focused = 0;
     ((void (*)(void *, struct wl_proxy *, unsigned, struct wl_proxy *))keyboard_orig[2])(data, kb, serial, surface);
 }
 
-// --- wl_pointer: enter · leave · motion · button ---
+// key(data, kb, serial, time, tecla, estado) · modifiers(data, kb, serial, dep, lat, lock, grupo)
+static void keyboard_key(void *data, struct wl_proxy *kb, unsigned serial, unsigned time, unsigned key, unsigned state) {
+    if (ctl_key(key, state)) return; // la pidió Playnix
+    ((void (*)(void *, struct wl_proxy *, unsigned, unsigned, unsigned, unsigned))keyboard_orig[3])(data, kb, serial, time, key, state);
+}
+
+static void keyboard_modifiers(void *data, struct wl_proxy *kb, unsigned serial, unsigned dep, unsigned lat, unsigned lck, unsigned group) {
+    int v[4] = { (int)dep, (int)lat, (int)lck, (int)group };
+    ctl_mods(v);
+    ((void (*)(void *, struct wl_proxy *, unsigned, unsigned, unsigned, unsigned, unsigned))keyboard_orig[4])(data, kb, serial, dep, lat, lck, group);
+}
+
+// --- wl_pointer: enter · leave · motion · button · axis ---
+// Sobre la capa de controles, todo va a Playnix (el cursor lo sigue poniendo Waydroid)
 typedef void (*button_fn)(void *, struct wl_proxy *, unsigned, unsigned, unsigned, unsigned);
 static fnptr pointer_orig[LISTENER_SLOTS], pointer_wrap[LISTENER_SLOTS];
 static int px, py;  // posición del puntero dentro de la superficie (lógica, entera)
@@ -380,6 +426,16 @@ static void pointer_enter(void *data, struct wl_proxy *p, unsigned serial, struc
     drag = IDLE; // p. ej. al terminar de mover la ventana
     px = sx / 256;
     py = sy / 256;
+    pointer_ctl = ctl_of_surface(surface);
+    if (pointer_ctl) {
+        int v[2] = { sx, sy };
+        ctl_pointer(pointer_ctl, EV_ENTER, v, 2);
+        ((void (*)(void *, struct wl_proxy *, unsigned, struct wl_proxy *, int, int))pointer_orig[0])(data, p, serial, surface, sx, sy);
+        // Android oculta su puntero al recibir toques: sobre la capa va uno propio
+        cursor_serial = serial;
+        ctl_cursor(serial);
+        return;
+    }
     ((void (*)(void *, struct wl_proxy *, unsigned, struct wl_proxy *, int, int))pointer_orig[0])(data, p, serial, surface, sx, sy);
 }
 
@@ -392,10 +448,16 @@ static void release_held(void *data, struct wl_proxy *p) {
 static void pointer_leave(void *data, struct wl_proxy *p, unsigned serial, struct wl_proxy *surface) {
     // Android nunca vio el clic retenido: se descarta
     drag = IDLE;
+    if (pointer_ctl) ctl_pointer(pointer_ctl, EV_LEAVE, 0, 0);
+    pointer_ctl = 0;
     ((void (*)(void *, struct wl_proxy *, unsigned, struct wl_proxy *))pointer_orig[1])(data, p, serial, surface);
 }
 
 static void pointer_motion(void *data, struct wl_proxy *p, unsigned time, int sx, int sy) {
+    if (pointer_ctl) {
+        int v[2] = { sx, sy };
+        return ctl_pointer(pointer_ctl, EV_MOTION, v, 2);
+    }
     px = sx / 256;
     py = sy / 256;
     if (drag == HELD) {
@@ -412,6 +474,10 @@ static void pointer_motion(void *data, struct wl_proxy *p, unsigned time, int sx
 }
 
 static void pointer_button(void *data, struct wl_proxy *p, unsigned serial, unsigned time, unsigned button, unsigned state) {
+    if (pointer_ctl) {
+        int v[2] = { (int)button, (int)state };
+        return ctl_pointer(pointer_ctl, EV_BUTTON, v, 2);
+    }
     if (button == BTN_LEFT) {
         if (state == 1 && drag == IDLE && py >= 0 && py < caption_height()) {
             // Si la app ocupa toda la pantalla no hay nada que mover. No sirve el estado
@@ -436,6 +502,14 @@ static void pointer_button(void *data, struct wl_proxy *p, unsigned serial, unsi
     ((button_fn)pointer_orig[3])(data, p, serial, time, button, state);
 }
 
+static void pointer_axis(void *data, struct wl_proxy *p, unsigned time, unsigned axis, int value) {
+    if (pointer_ctl) {
+        int v[2] = { (int)axis, value };
+        return ctl_pointer(pointer_ctl, EV_AXIS, v, 2);
+    }
+    ((void (*)(void *, struct wl_proxy *, unsigned, unsigned, int))pointer_orig[4])(data, p, time, axis, value);
+}
+
 static void wrap(fnptr *orig, fnptr *wrapped, const fnptr *impl) {
     for (int i = 0; i < LISTENER_SLOTS; i++) orig[i] = wrapped[i] = impl[i];
 }
@@ -457,6 +531,8 @@ static void wl_init(uintptr_t caller) {
     }
     if (!get_class || !get_user_data)
         __android_log_print(5, TAG, "sin funciones de Wayland: no se moverán ventanas");
+    else
+        ctl_start(caller);
 }
 
 __attribute__((visibility("default")))
@@ -466,7 +542,11 @@ int wl_proxy_add_listener(struct wl_proxy *proxy, fnptr *impl, void *data) {
 
     const char *cls = get_class(proxy);
     size_t n = slen(cls);
-    if (seq(cls, n, "wl_seat")) {
+    if (seq(cls, n, "wl_registry")) {
+        wrap(registry_orig, registry_wrap, impl);
+        registry_wrap[0] = (fnptr)registry_global;
+        impl = registry_wrap;
+    } else if (seq(cls, n, "wl_seat")) {
         seat = proxy;
     } else if (seq(cls, n, "xdg_surface")) {
         // ventana nueva (Waydroid crea su xdg_surface antes que su xdg_toplevel); una
@@ -480,6 +560,8 @@ int wl_proxy_add_listener(struct wl_proxy *proxy, fnptr *impl, void *data) {
         wins[i].maximized = wins[i].fullscreen = wins[i].fixed = 0;
         wins[i].gx = wins[i].gy = wins[i].gw = wins[i].gh = 0;
         wins[i].full = -1;
+        wins[i].surface = 0;
+        wins[i].app_id[0] = 0;
     } else if (seq(cls, n, "xdg_toplevel")) {
         int i = -1;
         for (int k = 0; k < WINDOWS; k++) if (wins[k].window == data && !wins[k].toplevel) { i = k; break; }
@@ -501,6 +583,8 @@ int wl_proxy_add_listener(struct wl_proxy *proxy, fnptr *impl, void *data) {
         wrap(keyboard_orig, keyboard_wrap, impl);
         keyboard_wrap[1] = (fnptr)keyboard_enter;
         keyboard_wrap[2] = (fnptr)keyboard_leave;
+        keyboard_wrap[3] = (fnptr)keyboard_key;
+        keyboard_wrap[4] = (fnptr)keyboard_modifiers;
         impl = keyboard_wrap;
     } else if (seq(cls, n, "wl_pointer")) {
         wrap(pointer_orig, pointer_wrap, impl);
@@ -508,6 +592,8 @@ int wl_proxy_add_listener(struct wl_proxy *proxy, fnptr *impl, void *data) {
         pointer_wrap[1] = (fnptr)pointer_leave;
         pointer_wrap[2] = (fnptr)pointer_motion;
         pointer_wrap[3] = (fnptr)pointer_button;
+        pointer_wrap[4] = (fnptr)pointer_axis;
+        pointer_proxy = proxy;
         impl = pointer_wrap;
     }
     return real_add_listener(proxy, impl, data);
@@ -528,6 +614,7 @@ static void set_fixed(int i, int on) {
 static void update_geometry(struct wl_proxy *surface, struct wl_proxy *region) {
     int r = slot_of_region(region, 0);
     int i = slot_of_window(get_user_data(surface));
+    if (i >= 0) wins[i].surface = surface;
     if (r < 0 || i < 0 || !regions[r].valid || !wins[i].xdg_surface) return;
     int x = regions[r].x0 + INPUT_OUTSET, y = regions[r].y0 + INPUT_OUTSET;
     int w = regions[r].x1 - regions[r].x0 - 2 * INPUT_OUTSET;
@@ -556,6 +643,7 @@ static void update_geometry(struct wl_proxy *surface, struct wl_proxy *region) {
         }
     }
     set_fixed(i, !full && !wins[i].maximized && !wins[i].fullscreen);
+    ctl_window_updated(i);
 }
 
 // Todas las peticiones de Waydroid pasan por aquí. Sus argumentos son enteros o
@@ -594,10 +682,23 @@ void wl_proxy_marshal(struct wl_proxy *p, unsigned opcode, ...) {
         marshal(p, opcode, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
         update_geometry(p, (struct wl_proxy *)a[0]);
         return;
+    } else if (seq(cls, n, "wl_pointer") && opcode == 0 /* set_cursor */ && pointer_ctl) {
+        return; // sobre la capa manda el cursor propio (ctl_cursor)
     } else if (seq(cls, n, "xdg_toplevel") && opcode == XDG_TOPLEVEL_DESTROY) {
         // ventana cerrada: no se debe volver a usar
         int i = slot_of_toplevel(p);
-        if (i >= 0) wins[i].window = wins[i].toplevel = 0;
+        if (i >= 0) {
+            ctl_window_gone(wins[i].window);
+            wins[i].window = wins[i].toplevel = 0;
+        }
+    } else if (seq(cls, n, "xdg_toplevel") && opcode == XDG_TOPLEVEL_SET_APP_ID && a[0]) {
+        int i = slot_of_toplevel(p);
+        const char *id = (const char *)a[0];
+        if (i >= 0) {
+            size_t k = 0;
+            for (; id[k] && k + 1 < sizeof wins[i].app_id; k++) wins[i].app_id[k] = id[k];
+            wins[i].app_id[k] = 0;
+        }
     } else if (seq(cls, n, "xdg_surface") && opcode == XDG_SURFACE_DESTROY) {
         int i = slot_of_xdg_surface(p);
         if (i >= 0) wins[i].window = wins[i].xdg_surface = wins[i].toplevel = 0;
@@ -644,4 +745,582 @@ int clipboard_register(void *self, const lstr *name) {
     (void)name;
     __android_log_print(4, TAG, "portapapeles de Waydroid omitido: lo comparte Playnix");
     return 0;
+}
+
+// ---------------------------------------------------------------------------------
+// Controles de juegos dentro de la ventana de la app.
+//
+// Playnix (en Linux) convierte teclado y mouse en toques. Antes lo hacía con su
+// propia ventana transparente encima del juego: salía aparte en Alt+Tab y se podía
+// mover sola. Ahora los controles viven dentro de la ventana de la app: una
+// subsuperficie encima de ella muestra la imagen que dibuja Playnix, y el mouse sobre
+// la app y las teclas que Playnix pide se le mandan a él en vez de a Android.
+//
+// Comunicación: socket Unix en /data/playnix/controls.sock. /data es la carpeta de
+// datos de Android que Waydroid monta desde Linux (~/.local/share/waydroid/data), así
+// que Playnix lo ve. Mensajes [tipo u32][largo u32][datos], enteros en el orden de
+// la máquina:
+//   Playnix → aquí: 1 HELLO app_id · 2 FRAME ancho alto píxeles (ARGB8888) ·
+//                   3 KEYS todas n teclas… (códigos evdev) · 4 LOCK sí/no
+//   aquí → Playnix: 1 SIZE ancho alto · 2 MOTION x y · 3 BUTTON botón estado ·
+//                   4 AXIS eje valor · 5 KEY tecla estado · 6 MODS dep lat lock grupo ·
+//                   7 REL dx dy · 8 LEAVE · 9 ENTER x y · 10 FOCUS sí/no · 11 GONE
+//   (x, y, valor, dx y dy en punto fijo 24.8 de Wayland; posiciones en la capa)
+//
+// Los objetos de Wayland propios (superficie, memoria compartida, bloqueo del mouse)
+// se crean con interfaces definidas aquí: el hwcomposer trae libwayland compilada
+// adentro y no exporta las suyas; el compositor solo ve los nombres.
+
+#define SOCK_DIR "/data/playnix"
+#define SOCK_PATH SOCK_DIR "/controls.sock"
+#define MSG_HELLO 1
+#define MSG_FRAME 2
+#define MSG_KEYS 3
+#define MSG_LOCK 4
+#define MAX_FRAME (64 << 20)
+
+// bionic
+struct sockaddr_un { unsigned short family; char path[108]; };
+struct pollfd { int fd; short events, revents; };
+extern int socket(int, int, int);
+extern int bind(int, const void *, unsigned);
+extern int listen(int, int);
+extern int accept4(int, void *, unsigned *, int);
+extern ssize_t recv(int, void *, size_t, int);
+extern ssize_t send(int, const void *, size_t, int);
+extern int poll(struct pollfd *, unsigned long, int);
+extern int unlink(const char *);
+extern int mkdir(const char *, unsigned);
+extern int memfd_create(const char *, unsigned);
+extern int ftruncate(int, long);
+extern void *mmap(void *, size_t, int, int, int, long);
+extern int munmap(void *, size_t);
+extern int pthread_create(unsigned long *, const void *, void *(*)(void *), void *);
+extern int pthread_mutexattr_init(long *);
+extern int pthread_mutexattr_settype(long *, int);
+extern int pthread_mutex_init(void *, const long *);
+extern int pthread_mutex_lock(void *);
+extern int pthread_mutex_unlock(void *);
+#define AF_UNIX 1
+#define SOCK_STREAM 1
+#define SOCK_CLOEXEC 0x80000
+#define MSG_DONTWAIT 0x40
+#define MSG_WAITALL 0x100
+#define MSG_NOSIGNAL 0x4000
+#define POLLIN 1
+#define MFD_CLOEXEC 1
+#define PROT_RW 3
+#define MAP_SHARED 1
+#define PTHREAD_MUTEX_RECURSIVE 1
+
+// --- Interfaces de Wayland (las del protocolo, con los mismos nombres) ---
+struct wl_message { const char *name; const char *signature; const struct wl_interface **types; };
+struct wl_interface { const char *name; int version; int method_count; const struct wl_message *methods;
+                      int event_count; const struct wl_message *events; };
+
+static const struct wl_interface i_surface, i_region, i_buffer, i_callback, i_output, i_pointer,
+    i_subsurface, i_shm_pool, i_locked, i_confined, i_relative;
+static const struct wl_interface *t_none[8];
+static const struct wl_interface *t_surface[] = { &i_surface };
+static const struct wl_interface *t_region[] = { &i_region };
+static const struct wl_interface *t_buffer[] = { &i_buffer, 0, 0 };
+static const struct wl_interface *t_callback[] = { &i_callback };
+static const struct wl_interface *t_output[] = { &i_output };
+static const struct wl_interface *t_subsurface[] = { &i_subsurface, &i_surface, &i_surface };
+static const struct wl_interface *t_pool[] = { &i_shm_pool, 0, 0 };
+static const struct wl_interface *t_new_buffer[] = { &i_buffer, 0, 0, 0, 0, 0 };
+static const struct wl_interface *t_lock[] = { &i_locked, &i_surface, &i_pointer, &i_region, 0 };
+static const struct wl_interface *t_confine[] = { &i_confined, &i_surface, &i_pointer, &i_region, 0 };
+static const struct wl_interface *t_relative[] = { &i_relative, &i_pointer };
+
+static const struct wl_message m_compositor[] = {
+    { "create_surface", "n", t_surface }, { "create_region", "n", t_region } };
+static const struct wl_interface i_compositor = { "wl_compositor", 4, 2, m_compositor, 0, 0 };
+static const struct wl_message m_surface[] = {
+    { "destroy", "", t_none }, { "attach", "?oii", t_buffer }, { "damage", "iiii", t_none },
+    { "frame", "n", t_callback }, { "set_opaque_region", "?o", t_region },
+    { "set_input_region", "?o", t_region }, { "commit", "", t_none },
+    { "set_buffer_transform", "2i", t_none }, { "set_buffer_scale", "3i", t_none },
+    { "damage_buffer", "4iiii", t_none } };
+static const struct wl_message e_surface[] = { { "enter", "o", t_output }, { "leave", "o", t_output } };
+static const struct wl_interface i_surface = { "wl_surface", 4, 10, m_surface, 2, e_surface };
+static const struct wl_message m_region[] = {
+    { "destroy", "", t_none }, { "add", "iiii", t_none }, { "subtract", "iiii", t_none } };
+static const struct wl_interface i_region = { "wl_region", 1, 3, m_region, 0, 0 };
+static const struct wl_message e_callback[] = { { "done", "u", t_none } };
+static const struct wl_interface i_callback = { "wl_callback", 1, 0, 0, 1, e_callback };
+static const struct wl_interface i_output = { "wl_output", 1, 0, 0, 0, 0 };
+static const struct wl_interface i_pointer = { "wl_pointer", 1, 0, 0, 0, 0 };
+static const struct wl_message m_subcompositor[] = {
+    { "destroy", "", t_none }, { "get_subsurface", "noo", t_subsurface } };
+static const struct wl_interface i_subcompositor = { "wl_subcompositor", 1, 2, m_subcompositor, 0, 0 };
+static const struct wl_message m_subsurface[] = {
+    { "destroy", "", t_none }, { "set_position", "ii", t_none }, { "place_above", "o", t_surface },
+    { "place_below", "o", t_surface }, { "set_sync", "", t_none }, { "set_desync", "", t_none } };
+static const struct wl_interface i_subsurface = { "wl_subsurface", 1, 6, m_subsurface, 0, 0 };
+static const struct wl_message m_shm[] = { { "create_pool", "nhi", t_pool } };
+static const struct wl_message e_shm[] = { { "format", "u", t_none } };
+static const struct wl_interface i_shm = { "wl_shm", 1, 1, m_shm, 1, e_shm };
+static const struct wl_message m_pool[] = {
+    { "create_buffer", "niiiiu", t_new_buffer }, { "destroy", "", t_none }, { "resize", "i", t_none } };
+static const struct wl_interface i_shm_pool = { "wl_shm_pool", 1, 3, m_pool, 0, 0 };
+static const struct wl_message m_buffer[] = { { "destroy", "", t_none } };
+static const struct wl_message e_buffer[] = { { "release", "", t_none } };
+static const struct wl_interface i_buffer = { "wl_buffer", 1, 1, m_buffer, 1, e_buffer };
+static const struct wl_message m_constraints[] = {
+    { "destroy", "", t_none }, { "lock_pointer", "noo?ou", t_lock }, { "confine_pointer", "noo?ou", t_confine } };
+static const struct wl_interface i_constraints = { "zwp_pointer_constraints_v1", 1, 3, m_constraints, 0, 0 };
+static const struct wl_message m_locked[] = {
+    { "destroy", "", t_none }, { "set_cursor_position_hint", "ff", t_none }, { "set_region", "?o", t_region } };
+static const struct wl_message e_locked[] = { { "locked", "", t_none }, { "unlocked", "", t_none } };
+static const struct wl_interface i_locked = { "zwp_locked_pointer_v1", 1, 3, m_locked, 2, e_locked };
+static const struct wl_interface i_confined = { "zwp_confined_pointer_v1", 1, 0, 0, 0, 0 };
+static const struct wl_message m_relmgr[] = {
+    { "destroy", "", t_none }, { "get_relative_pointer", "no", t_relative } };
+static const struct wl_interface i_relmgr = { "zwp_relative_pointer_manager_v1", 1, 2, m_relmgr, 0, 0 };
+static const struct wl_message m_relative[] = { { "destroy", "", t_none } };
+static const struct wl_message e_relative[] = { { "relative_motion", "uuffff", t_none } };
+static const struct wl_interface i_relative = { "zwp_relative_pointer_v1", 1, 1, m_relative, 1, e_relative };
+
+typedef struct wl_proxy *(*constructor_fn)(struct wl_proxy *, unsigned, const struct wl_interface *, ...);
+typedef struct wl_proxy *(*constructor_ver_fn)(struct wl_proxy *, unsigned, const struct wl_interface *, unsigned, ...);
+static constructor_fn construct;
+static constructor_ver_fn construct_ver;
+static void (*proxy_destroy)(struct wl_proxy *);
+static unsigned (*proxy_version)(struct wl_proxy *);
+static int (*display_flush)(void *);
+
+static struct wl_proxy *compositor, *subcompositor, *shm, *constraints, *relmgr;
+static void *wl_display_ptr;
+// Recursivo: los ganchos pueden volver a entrar desde el mismo hilo
+static long big_lock[8];
+
+static void lock(void) { pthread_mutex_lock(big_lock); }
+static void unlock(void) { pthread_mutex_unlock(big_lock); }
+
+// La wl_display está en la propia wl_proxy (después de su wl_object)
+static void *display_of(struct wl_proxy *p) { return *(void **)((char *)p + 24); }
+static void flush(void) { if (wl_display_ptr) display_flush(wl_display_ptr); }
+
+static void destroy(struct wl_proxy **p, unsigned destroy_opcode) {
+    if (!*p) return;
+    marshal(*p, destroy_opcode);
+    proxy_destroy(*p);
+    *p = 0;
+}
+
+// --- Clientes (una capa por app) ---
+#define CLIENTS 8
+static struct ctl {
+    int fd;                         // -1: libre
+    char app_id[160];               // "waydroid.<paquete>"
+    void *window;                   // ventana con la capa (0: todavía no aparece)
+    struct wl_proxy *surface, *subsurface, *pool, *buffer[2], *locked, *relative;
+    int mapfd, bw, bh, next;
+    unsigned char *map;
+    size_t map_size;
+    int w, h;                       // tamaño de la capa enviado a Playnix
+    int all_keys;
+    unsigned char keys[96];         // teclas pedidas (bits, códigos evdev < 768)
+} ctls[CLIENTS];
+static unsigned char key_to_ctl[768]; // 0: Android; n: ctls[n-1] (dónde fue cada tecla)
+
+static void send_ev(struct ctl *c, unsigned type, const int *v, unsigned n) {
+    unsigned buf[2 + 4];
+    if (c->fd < 0 || n > 4) return;
+    buf[0] = type;
+    buf[1] = n * 4;
+    for (unsigned k = 0; k < n; k++) buf[2 + k] = (unsigned)v[k];
+    send(c->fd, buf, (2 + n) * 4, MSG_DONTWAIT | MSG_NOSIGNAL);
+}
+
+static struct ctl *ctl_of_window(void *window) {
+    if (!window) return 0;
+    for (int k = 0; k < CLIENTS; k++) if (ctls[k].fd >= 0 && ctls[k].window == window) return &ctls[k];
+    return 0;
+}
+
+static void ctl_unlock_pointer(struct ctl *c) {
+    destroy(&c->relative, 0);
+    destroy(&c->locked, 0);
+}
+
+// Quita la capa de la ventana (la ventana se cerró o Playnix se fue)
+static void ctl_detach(struct ctl *c) {
+    ctl_unlock_pointer(c);
+    destroy(&c->subsurface, 0);
+    destroy(&c->surface, 0);
+    if (pointer_ctl == c) pointer_ctl = 0;
+    c->window = 0;
+    c->w = c->h = 0;
+}
+
+static void ctl_free_buffers(struct ctl *c) {
+    destroy(&c->buffer[0], 0);
+    destroy(&c->buffer[1], 0);
+    destroy(&c->pool, 1);
+    if (c->map) munmap(c->map, c->map_size);
+    if (c->mapfd >= 0) close(c->mapfd);
+    c->map = 0;
+    c->mapfd = -1;
+    c->bw = c->bh = 0;
+}
+
+static void ctl_close(struct ctl *c) {
+    ctl_detach(c);
+    ctl_free_buffers(c);
+    for (int k = 0; k < 768; k++) if (key_to_ctl[k] == c - ctls + 1) key_to_ctl[k] = 0;
+    close(c->fd);
+    c->fd = -1;
+    c->app_id[0] = 0;
+    flush();
+}
+
+// Pone la capa en la ventana `i` (llamado con el lock tomado)
+static void ctl_attach(struct ctl *c, int i) {
+    if (!compositor || !subcompositor || !wins[i].surface) return;
+    c->surface = construct(compositor, 0, &i_surface, (void *)0);
+    c->subsurface = construct(subcompositor, 1, &i_subsurface, (void *)0, c->surface, wins[i].surface);
+    marshal(c->subsurface, 5); // desync: se actualiza sin esperar al juego
+    marshal(c->subsurface, 1, wins[i].gx, wins[i].gy);
+    c->window = wins[i].window;
+    c->w = wins[i].gw;
+    c->h = wins[i].gh;
+    int v[2] = { c->w, c->h };
+    send_ev(c, EV_SIZE, v, 2);
+    flush();
+}
+
+// Cada cuadro, después de conocer la geometría de la ventana `i`
+static void ctl_window_updated(int i) {
+    lock();
+    struct ctl *c = ctl_of_window(wins[i].window);
+    if (c) {
+        if (c->w != wins[i].gw || c->h != wins[i].gh) {
+            c->w = wins[i].gw;
+            c->h = wins[i].gh;
+            int v[2] = { c->w, c->h };
+            send_ev(c, EV_SIZE, v, 2);
+        }
+        marshal(c->subsurface, 1, wins[i].gx, wins[i].gy);
+    } else if (wins[i].app_id[0]) {
+        size_t n = slen(wins[i].app_id);
+        for (int k = 0; k < CLIENTS; k++)
+            if (ctls[k].fd >= 0 && !ctls[k].window && seq(ctls[k].app_id, slen(ctls[k].app_id), wins[i].app_id)
+                && slen(ctls[k].app_id) == n)
+                ctl_attach(&ctls[k], i);
+    }
+    unlock();
+}
+
+static void ctl_window_gone(void *window) {
+    lock();
+    struct ctl *c = ctl_of_window(window);
+    if (c) {
+        ctl_detach(c);
+        send_ev(c, EV_GONE, 0, 0);
+    }
+    unlock();
+}
+
+static int recv_all(int fd, void *buf, size_t n) {
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = recv(fd, (char *)buf + got, n - got, MSG_WAITALL);
+        if (r <= 0) return 0;
+        got += r;
+    }
+    return 1;
+}
+
+static int skip(int fd, size_t n) {
+    char tmp[4096];
+    while (n) {
+        size_t k = n < sizeof tmp ? n : sizeof tmp;
+        if (!recv_all(fd, tmp, k)) return 0;
+        n -= k;
+    }
+    return 1;
+}
+
+static int ctl_frame(struct ctl *c, unsigned len) {
+    unsigned wh[2];
+    if (len < 8 || !recv_all(c->fd, wh, 8)) return 0;
+    size_t size = (size_t)wh[0] * wh[1] * 4;
+    if (!wh[0] || !wh[1] || size + 8 != len || size > MAX_FRAME) return skip(c->fd, len - 8);
+    lock();
+    if ((int)wh[0] != c->bw || (int)wh[1] != c->bh) {
+        ctl_free_buffers(c);
+        c->mapfd = memfd_create("playnix-controles", MFD_CLOEXEC);
+        if (c->mapfd < 0 || ftruncate(c->mapfd, size * 2) < 0) { unlock(); return skip(c->fd, size); }
+        c->map = mmap(0, size * 2, PROT_RW, MAP_SHARED, c->mapfd, 0);
+        if (c->map == (void *)-1) { c->map = 0; unlock(); return skip(c->fd, size); }
+        c->map_size = size * 2;
+        c->pool = construct(shm, 0, &i_shm_pool, (void *)0, c->mapfd, (int)(size * 2));
+        for (int k = 0; k < 2; k++)
+            c->buffer[k] = construct(c->pool, 0, &i_buffer, (void *)0, (int)(k * size), (int)wh[0], (int)wh[1],
+                                     (int)wh[0] * 4, 0 /* ARGB8888 */);
+        c->bw = wh[0];
+        c->bh = wh[1];
+    }
+    unsigned char *dst = c->map + c->next * size;
+    unlock();
+    if (!recv_all(c->fd, dst, size)) return 0;
+    lock();
+    if (c->surface && c->buffer[c->next]) {
+        marshal(c->surface, 1, c->buffer[c->next], 0, 0);
+        if (proxy_version(c->surface) >= 4) marshal(c->surface, 9, 0, 0, c->bw, c->bh);
+        else marshal(c->surface, 2, 0, 0, c->bw, c->bh);
+        marshal(c->surface, 6);
+        flush();
+    }
+    c->next ^= 1;
+    unlock();
+    return 1;
+}
+
+static void relative_motion(void *data, struct wl_proxy *rp, unsigned hi, unsigned lo,
+                            int dx, int dy, int dxu, int dyu) {
+    (void)rp; (void)hi; (void)lo; (void)dx; (void)dy;
+    struct ctl *c = data;
+    int v[2] = { dxu, dyu };
+    lock();
+    send_ev(c, EV_REL, v, 2);
+    unlock();
+}
+static const fnptr relative_listener[] = { (fnptr)relative_motion };
+
+static void ctl_lock_pointer(struct ctl *c, int on) {
+    if (!on) {
+        ctl_unlock_pointer(c);
+        if (pointer_ctl == c) ctl_cursor(cursor_serial);
+        return;
+    }
+    if (c->locked || !c->surface || !constraints || !relmgr || !pointer_proxy) return;
+    c->locked = construct(constraints, 1, &i_locked, (void *)0, c->surface, pointer_proxy, (void *)0, 2 /* persistente */);
+    c->relative = construct(relmgr, 1, &i_relative, (void *)0, pointer_proxy);
+    real_add_listener(c->relative, (fnptr *)relative_listener, c);
+    flush();
+    if (pointer_ctl == c) ctl_cursor(cursor_serial);
+}
+
+// Lee un mensaje de Playnix; 0 si se cortó
+static int ctl_read(struct ctl *c) {
+    unsigned head[2];
+    if (!recv_all(c->fd, head, 8)) return 0;
+    unsigned type = head[0], len = head[1];
+    if (type == MSG_FRAME) return ctl_frame(c, len);
+    if (len > 4096) return 0;
+    unsigned char buf[4096];
+    if (len && !recv_all(c->fd, buf, len)) return 0;
+    lock();
+    if (type == MSG_HELLO && len < sizeof c->app_id) {
+        for (unsigned k = 0; k < len; k++) c->app_id[k] = buf[k];
+        c->app_id[len] = 0;
+        for (int i = 0; i < WINDOWS; i++)
+            if (wins[i].window && wins[i].gw && !ctl_of_window(wins[i].window)
+                && seq(wins[i].app_id, slen(wins[i].app_id), c->app_id) && slen(c->app_id) == slen(wins[i].app_id)) {
+                ctl_attach(c, i);
+                break;
+            }
+    } else if (type == MSG_KEYS && len >= 8) {
+        unsigned *v = (unsigned *)buf;
+        c->all_keys = v[0] != 0;
+        for (int k = 0; k < 96; k++) c->keys[k] = 0;
+        for (unsigned k = 0; k < v[1] && 8 + k * 4 + 4 <= len; k++)
+            if (v[2 + k] < 768) c->keys[v[2 + k] / 8] |= 1 << (v[2 + k] % 8);
+    } else if (type == MSG_LOCK && len >= 4) {
+        ctl_lock_pointer(c, ((unsigned *)buf)[0] != 0);
+    }
+    unlock();
+    return 1;
+}
+
+static void *ctl_thread(void *arg) {
+    (void)arg;
+    mkdir(SOCK_DIR, 0700);
+    unlink(SOCK_PATH);
+    int srv = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_un addr = { AF_UNIX, SOCK_PATH };
+    if (srv < 0 || bind(srv, &addr, sizeof addr) < 0 || listen(srv, 4) < 0) {
+        __android_log_print(5, TAG, "sin socket de controles: los controles irán en otra ventana");
+        return 0;
+    }
+    for (;;) {
+        struct pollfd fds[1 + CLIENTS];
+        int n = 0;
+        fds[n++] = (struct pollfd){ srv, POLLIN, 0 };
+        for (int k = 0; k < CLIENTS; k++) if (ctls[k].fd >= 0) fds[n++] = (struct pollfd){ ctls[k].fd, POLLIN, 0 };
+        if (poll(fds, n, -1) < 0) continue;
+        for (int j = 1; j < n; j++) {
+            if (!fds[j].revents) continue;
+            for (int k = 0; k < CLIENTS; k++) {
+                if (ctls[k].fd != fds[j].fd) continue;
+                if (!ctl_read(&ctls[k])) {
+                    lock();
+                    ctl_close(&ctls[k]);
+                    unlock();
+                }
+                break;
+            }
+        }
+        if (fds[0].revents) {
+            int fd = accept4(srv, 0, 0, SOCK_CLOEXEC);
+            if (fd < 0) continue;
+            lock();
+            int k = 0;
+            while (k < CLIENTS && ctls[k].fd >= 0) k++;
+            if (k == CLIENTS) {
+                close(fd);
+            } else {
+                struct ctl *c = &ctls[k];
+                for (unsigned b = 0; b < sizeof *c; b++) ((char *)c)[b] = 0;
+                c->fd = fd;
+                c->mapfd = -1;
+            }
+            unlock();
+        }
+    }
+    return 0;
+}
+
+static void ctl_start(uintptr_t caller) {
+    construct = (constructor_fn)resolve(caller, "wl_proxy_marshal_constructor");
+    construct_ver = (constructor_ver_fn)resolve(caller, "wl_proxy_marshal_constructor_versioned");
+    proxy_destroy = (void (*)(struct wl_proxy *))resolve(caller, "wl_proxy_destroy");
+    proxy_version = (unsigned (*)(struct wl_proxy *))resolve(caller, "wl_proxy_get_version");
+    display_flush = (int (*)(void *))resolve(caller, "wl_display_flush");
+    if (!construct || !construct_ver || !proxy_destroy || !proxy_version || !display_flush) return;
+    long attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(big_lock, &attr);
+    for (int k = 0; k < CLIENTS; k++) ctls[k].fd = -1;
+    unsigned long tid;
+    pthread_create(&tid, 0, ctl_thread, 0);
+}
+
+// --- wl_registry: global(data, registry, nombre, interfaz, versión) ---
+
+static void registry_global(void *data, struct wl_proxy *r, unsigned name, const char *iface, unsigned version) {
+    ((void (*)(void *, struct wl_proxy *, unsigned, const char *, unsigned))registry_orig[0])(data, r, name, iface, version);
+    if (!construct_ver) return;
+    size_t n = slen(iface);
+    const struct wl_interface *want = 0;
+    struct wl_proxy **slot = 0;
+    unsigned ver = 1;
+    if (seq(iface, n, "wl_compositor")) { want = &i_compositor; slot = &compositor; ver = version < 4 ? version : 4; }
+    else if (seq(iface, n, "wl_subcompositor")) { want = &i_subcompositor; slot = &subcompositor; }
+    else if (seq(iface, n, "wl_shm")) { want = &i_shm; slot = &shm; }
+    else if (seq(iface, n, "zwp_pointer_constraints_v1")) { want = &i_constraints; slot = &constraints; }
+    else if (seq(iface, n, "zwp_relative_pointer_manager_v1")) { want = &i_relmgr; slot = &relmgr; }
+    if (!want || *slot) return;
+    wl_display_ptr = display_of(r);
+    *slot = construct_ver(r, 0, want, ver, name, want->name, ver, (void *)0);
+}
+
+// --- Entrada para Playnix (desde los listeners del puntero y el teclado) ---
+static struct ctl *ctl_of_surface(struct wl_proxy *surface) {
+    struct ctl *found = 0;
+    if (!surface || !construct) return 0;
+    lock();
+    for (int k = 0; k < CLIENTS; k++) if (ctls[k].fd >= 0 && ctls[k].surface == surface) found = &ctls[k];
+    unlock();
+    return found;
+}
+
+static void ctl_pointer(struct ctl *c, unsigned type, const int *v, unsigned n) {
+    lock();
+    send_ev(c, type, v, n);
+    unlock();
+}
+
+// ¿La tecla es para Playnix? Cada tecla suelta va adonde fue al presionarla
+static int ctl_key(unsigned key, unsigned state) {
+    if (key >= 768 || !construct) return 0;
+    int mine = 0;
+    lock();
+    if (state) {
+        struct ctl *c = ctl_of_window(focused);
+        key_to_ctl[key] = 0;
+        if (c && (c->all_keys || (c->keys[key / 8] >> (key % 8) & 1))) {
+            key_to_ctl[key] = c - ctls + 1;
+            mine = 1;
+        }
+    } else if (key_to_ctl[key]) {
+        mine = 1;
+    }
+    if (mine) {
+        int v[2] = { (int)key, (int)state };
+        send_ev(&ctls[key_to_ctl[key] - 1], EV_KEY, v, 2);
+        if (!state) key_to_ctl[key] = 0;
+    }
+    unlock();
+    return mine;
+}
+
+static void ctl_mods(const int *v) {
+    if (!construct) return;
+    lock();
+    struct ctl *c = ctl_of_window(focused);
+    if (c) send_ev(c, EV_MODS, v, 4);
+    unlock();
+}
+
+static void ctl_focus(void *window, int on) {
+    if (!construct) return;
+    lock();
+    struct ctl *c = ctl_of_window(window);
+    if (c) send_ev(c, EV_FOCUS, &on, 1);
+    unlock();
+}
+
+// --- Cursor sobre la capa ---
+// Flecha clásica: X borde negro, . relleno blanco
+static const char *const arrow[] = {
+    "X           ", "XX          ", "X.X         ", "X..X        ", "X...X       ",
+    "X....X      ", "X.....X     ", "X......X    ", "X.......X   ", "X........X  ",
+    "X.........X ", "X......XXXXX", "X...X..X    ", "X..XX..X    ", "X.X  X..X   ",
+    "XX   X..X   ", "X     X..X  ", "      X..X  ", "       XX   ",
+};
+#define ARROW_W 12
+#define ARROW_H 19
+static struct wl_proxy *cursor_surface;
+
+static void cursor_create(void) {
+    int scale = 2; // nítida también con escalado 2
+    int w = ARROW_W * scale, h = ARROW_H * scale;
+    size_t size = (size_t)w * h * 4;
+    int fd = memfd_create("playnix-cursor", MFD_CLOEXEC);
+    if (fd < 0 || ftruncate(fd, size) < 0) { if (fd >= 0) close(fd); return; }
+    unsigned *px = mmap(0, size, PROT_RW, MAP_SHARED, fd, 0);
+    if (px == (void *)-1) { close(fd); return; }
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            char c = arrow[y / scale][x / scale];
+            px[y * w + x] = c == 'X' ? 0xFF000000u : c == '.' ? 0xFFFFFFFFu : 0;
+        }
+    munmap(px, size);
+    struct wl_proxy *pool = construct(shm, 0, &i_shm_pool, (void *)0, fd, (int)size);
+    struct wl_proxy *buf = construct(pool, 0, &i_buffer, (void *)0, 0, w, h, w * 4, 0 /* ARGB8888 */);
+    destroy(&pool, 1);
+    close(fd);
+    cursor_surface = construct(compositor, 0, &i_surface, (void *)0);
+    marshal(cursor_surface, 1, buf, 0, 0);
+    marshal(cursor_surface, 8, scale);           // set_buffer_scale
+    marshal(cursor_surface, 2, 0, 0, w, h);
+    marshal(cursor_surface, 6);
+}
+
+// Pone la flecha (u oculta el cursor si Playnix fijó el mouse para apuntar)
+static void ctl_cursor(unsigned serial) {
+    if (!construct || !pointer_proxy || !compositor || !shm) return;
+    lock();
+    if (!cursor_surface) cursor_create();
+    struct ctl *c = pointer_ctl;
+    int hidden = c && c->locked;
+    if (cursor_surface)
+        marshal(pointer_proxy, 0, serial, hidden ? 0 : cursor_surface, 0, 0);
+    flush();
+    unlock();
 }

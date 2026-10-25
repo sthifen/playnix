@@ -1,6 +1,8 @@
-//! Capa transparente encima del juego. El juego ocupa toda la pantalla de Android
-//! y su ventana va maximizada (libpnxh.so, data/hwc-fix), así que una ventana
-//! maximizada encima coincide pixel por pixel: lo que se toca aquí se manda a
+//! Capa de controles encima del juego. Normalmente va dentro de la propia ventana
+//! del juego (libpnxh.so la dibuja y le pasa el mouse y las teclas, ver embed.rs).
+//! Si eso no está disponible, va en una ventana transparente aparte: el juego ocupa
+//! toda la pantalla de Android y su ventana va maximizada, así que una ventana
+//! maximizada encima coincide pixel por pixel. Lo que se toca aquí se manda a
 //! Android en el mismo punto.
 //!
 //! Jugar: las teclas del perfil se convierten en toques; el clic izquierdo
@@ -8,12 +10,13 @@
 //! agrandar/encoger; el resto de teclas pasa a Android. F1 abre el editor y F2
 //! muestra u oculta las teclas; el botón ⋮ del borde derecho tiene todo eso.
 
+use super::embed::{self, Embed};
 use super::pointer::PointerLock;
 use super::profile::{self, Key, Kind, Profile, Widget};
 use super::scrcpy::{self, Link};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -80,13 +83,57 @@ enum Tool {
     Done,
 }
 
+/// Dónde se dibuja la capa: su propia ventana o la ventana del juego.
+#[derive(Clone)]
+enum Canvas {
+    Area(gtk::DrawingArea),
+    Embed(Rc<EmbedCanvas>),
+}
+
+/// Redibuja una vez por vuelta del bucle, aunque se pida muchas veces.
+#[derive(Default)]
+struct EmbedCanvas {
+    pending: Cell<bool>,
+    render: RefCell<Option<Box<dyn Fn()>>>,
+}
+
+impl Canvas {
+    fn queue_draw(&self) {
+        match self {
+            Canvas::Area(a) => a.queue_draw(),
+            Canvas::Embed(c) => {
+                if c.pending.replace(true) {
+                    return;
+                }
+                let c = c.clone();
+                glib::idle_add_local_once(move || {
+                    c.pending.set(false);
+                    if let Some(render) = c.render.borrow().as_ref() {
+                        render();
+                    }
+                });
+            }
+        }
+    }
+}
+
 pub(super) struct State {
     link: Arc<Link>,
     pkg: String,
     profile: Profile,
-    area: gtk::DrawingArea,
+    area: Canvas,
     win: glib::WeakRef<gtk::ApplicationWindow>,
     lock: Option<Rc<PointerLock>>,
+    /// capa dentro de la ventana del juego
+    embed: Option<Rc<Embed>>,
+    /// mouse fijado por el hwcomposer (con `embed`)
+    locked: bool,
+    /// teclas pedidas al hwcomposer la última vez
+    claimed: Option<(bool, Vec<u32>)>,
+    /// menú ⋮ abierto
+    menu: bool,
+    /// cierra los controles
+    quit: Option<Rc<dyn Fn()>>,
     /// tamaño de la capa en píxeles lógicos
     view: (f64, f64),
     mode: Mode,
@@ -173,6 +220,22 @@ impl State {
         (cx + dx as f64 * r * k, cy + dy as f64 * r * k)
     }
 
+    fn unlock_pointer(&mut self) {
+        if let Some(l) = &self.lock {
+            l.unlock();
+        }
+        if self.locked {
+            if let Some(e) = &self.embed {
+                e.lock(false);
+            }
+            self.locked = false;
+        }
+    }
+
+    fn pointer_locked(&self) -> bool {
+        self.locked || self.lock.as_ref().is_some_and(|l| l.is_locked())
+    }
+
     /// Levanta todos los dedos (al cambiar de modo, al cerrar, al perder el foco).
     fn lift_all(&mut self) {
         let mut ups: Vec<(u64, (f64, f64))> = Vec::new();
@@ -198,9 +261,7 @@ impl State {
                 ups.push((id, a.pos));
             }
         }
-        if let Some(l) = &self.lock {
-            l.unlock();
-        }
+        self.unlock_pointer();
         for (id, pos) in ups {
             self.touch_view(scrcpy::UP, id, pos);
             self.release_finger(id);
@@ -279,11 +340,15 @@ fn aim_toggle(st: &St, i: usize) {
         let mut s = st.borrow_mut();
         let center = s.to_view(s.profile.widgets[i].center());
         s.aim = Some(Aim { widget: i, finger: None, pos: center });
-        if s.lock.is_none() {
+        if let Some(e) = s.embed.clone() {
+            // el hwcomposer fija el mouse y manda el movimiento relativo (Ev::Rel)
+            e.lock(true);
+            s.locked = true;
+        } else if s.lock.is_none() {
             s.lock = s.win.upgrade().and_then(|w| PointerLock::new(w.upcast_ref()));
         }
     }
-    let lock = st.borrow().lock.clone();
+    let lock = if st.borrow().locked { None } else { st.borrow().lock.clone() };
     match lock {
         Some(lock) => {
             let weak = Rc::downgrade(st);
@@ -293,6 +358,7 @@ fn aim_toggle(st: &St, i: usize) {
                 }
             });
         }
+        None if st.borrow().locked => {}
         // sin bloqueo, se usa el movimiento normal del cursor (ver `motion`)
         None => toast(st, "Tu escritorio no permite fijar el mouse: apunta moviéndolo", 3),
     }
@@ -303,9 +369,7 @@ fn aim_toggle(st: &St, i: usize) {
 
 fn aim_exit(st: &St) {
     let mut s = st.borrow_mut();
-    if let Some(l) = &s.lock {
-        l.unlock();
-    }
+    s.unlock_pointer();
     if let Some(a) = s.aim.take() {
         if let Some(id) = a.finger {
             s.touch_view(scrcpy::UP, id, a.pos);
@@ -632,33 +696,74 @@ fn menu_rect(view: (f64, f64)) -> (f64, f64, f64, f64) {
     (view.0 - w, (view.1 - h) / 2.0, w, h)
 }
 
-fn open_menu(st: &St) {
-    let (area, view, edit) = {
-        let s = st.borrow();
-        (s.area.clone(), s.view, s.mode == Mode::Edit)
-    };
-    let menu = gio::Menu::new();
-    menu.append(Some(if edit { "Guardar controles" } else { "Editar controles (F1)" }), Some("ctl.edit"));
-    if !edit {
-        menu.append(Some("Mostrar u ocultar teclas (F2)"), Some("ctl.hints"));
+/// Opciones del menú ⋮ (dibujado en la capa: dentro de la ventana del juego no hay
+/// widgets de GTK).
+fn menu_items(edit: bool) -> Vec<(&'static str, fn(&St))> {
+    let mut items: Vec<(&'static str, fn(&St))> = Vec::new();
+    if edit {
+        items.push(("Guardar controles (F1)", edit_exit));
+    } else {
+        items.push(("Editar controles (F1)", edit_enter));
+        items.push(("Mostrar u ocultar teclas (F2)", |st| on_key(st, gdk::Key::F2, true, gdk::ModifierType::empty())));
     }
-    menu.append(Some("Cómo se usa"), Some("ctl.help"));
-    menu.append(Some("Quitar controles"), Some("ctl.close"));
-    let pop = gtk::PopoverMenu::from_model(Some(&menu));
-    pop.set_parent(&area);
-    let (x, y, w, h) = menu_rect(view);
-    pop.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, w as i32, h as i32)));
-    pop.set_position(gtk::PositionType::Left);
-    pop.set_has_arrow(false);
-    pop.connect_closed(|p| {
-        let p = p.clone();
-        glib::idle_add_local_once(move || p.unparent());
-    });
-    pop.popup();
+    items.push(("Cómo se usa", show_help));
+    items.push(("Quitar controles", |st| {
+        let quit = st.borrow().quit.clone();
+        if let Some(q) = quit {
+            q();
+        }
+    }));
+    items
+}
+
+/// Rectángulos de las opciones, a la izquierda del botón ⋮.
+fn menu_rects(view: (f64, f64), n: usize) -> Vec<(f64, f64, f64, f64)> {
+    let (mx, my, _, mh) = menu_rect(view);
+    let (w, h) = (270.0, 40.0);
+    let top = (my + mh / 2.0 - n as f64 * h / 2.0).max(8.0);
+    (0..n).map(|i| (mx - w - 10.0, top + i as f64 * h, w, h)).collect()
+}
+
+/// Clic con el menú abierto: elige una opción o lo cierra.
+fn menu_click(st: &St, pos: (f64, f64)) {
+    let (view, edit) = {
+        let mut s = st.borrow_mut();
+        s.menu = false;
+        s.area.queue_draw();
+        (s.view, s.mode == Mode::Edit)
+    };
+    let items = menu_items(edit);
+    let picked = menu_rects(view, items.len()).into_iter().position(|r| inside(pos, r));
+    if let Some(i) = picked {
+        (items[i].1)(st);
+    }
+}
+
+fn draw_menu(s: &State, cr: &gtk::cairo::Context) {
+    let items = menu_items(s.mode == Mode::Edit);
+    let rects = menu_rects(s.view, items.len());
+    let (x, y, w, _) = rects[0];
+    let h = rects.len() as f64 * rects[0].3;
+    rounded(cr, x - 6.0, y - 6.0, w + 12.0, h + 12.0, 12.0);
+    cr.set_source_rgba(0.12, 0.12, 0.13, 0.96);
+    let _ = cr.fill();
+    for ((label, _), (rx, ry, rw, rh)) in items.iter().zip(&rects) {
+        if inside(s.pointer, (*rx, *ry, *rw, *rh)) {
+            rounded(cr, *rx, *ry, *rw, *rh, 8.0);
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.10);
+            let _ = cr.fill();
+        }
+        let l = layout(cr, label, 14.0);
+        let (_, th) = l.pixel_size();
+        cr.move_to(rx + 14.0, ry + (rh - th as f64) / 2.0);
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
+        pangocairo::functions::show_layout(cr, &l);
+        cr.new_path();
+    }
 }
 
 fn show_help(st: &St) {
-    let Some(win) = st.borrow().win.upgrade() else { return };
+    let win = st.borrow().win.upgrade();
     let body = "Jugar\n\
         • Clic izquierdo y arrastrar: deslizar un dedo.\n\
         • Shift + clic derecho: agrandar (dos dedos que se separan); mantenlo para seguir.\n\
@@ -673,7 +778,8 @@ fn show_help(st: &St) {
         F2 muestra u oculta las teclas sobre el juego.";
     let dialog = adw::AlertDialog::new(Some("Controles del juego"), Some(body));
     dialog.add_response("ok", "Entendido");
-    dialog.present(Some(&win));
+    // dentro de la ventana del juego no hay dónde ponerlo: va en su propia ventana
+    dialog.present(win.as_ref());
 }
 
 fn edit_enter(st: &St) {
@@ -840,6 +946,14 @@ fn edit_key(st: &St, keyval: gdk::Key) {
 // --- Entrada (eventos de GTK o del guion de pruebas) --------------------------
 
 fn on_key(st: &St, keyval: gdk::Key, pressed: bool, mods: gdk::ModifierType) {
+    if st.borrow().menu && keyval == gdk::Key::Escape {
+        if pressed {
+            let mut s = st.borrow_mut();
+            s.menu = false;
+            s.area.queue_draw();
+        }
+        return;
+    }
     if keyval == gdk::Key::F1 {
         if pressed {
             if st.borrow().mode == Mode::Play { edit_enter(st) } else { edit_exit(st) }
@@ -898,9 +1012,18 @@ fn on_key(st: &St, keyval: gdk::Key, pressed: bool, mods: gdk::ModifierType) {
 
 fn on_button(st: &St, button: u32, pressed: bool, pos: (f64, f64), mods: gdk::ModifierType) {
     st.borrow_mut().pointer = pos;
+    if st.borrow().menu {
+        if pressed {
+            menu_click(st, pos);
+        }
+        return;
+    }
     if button == 1 && inside(pos, menu_rect(st.borrow().view)) && st.borrow().drag.is_none() {
         if pressed {
-            open_menu(st);
+            let mut s = st.borrow_mut();
+            s.lift_all();
+            s.menu = true;
+            s.area.queue_draw();
         }
         return;
     }
@@ -941,13 +1064,19 @@ fn on_button(st: &St, button: u32, pressed: bool, pos: (f64, f64), mods: gdk::Mo
 }
 
 fn on_motion(st: &St, pos: (f64, f64)) {
+    if st.borrow().menu {
+        let mut s = st.borrow_mut();
+        s.pointer = pos;
+        s.area.queue_draw();
+        return;
+    }
     if st.borrow().mode == Mode::Edit {
         st.borrow_mut().pointer = pos;
         return edit_motion(st, pos);
     }
     let (last, aiming, locked) = {
         let s = st.borrow();
-        (s.pointer, s.aim.is_some(), s.lock.as_ref().is_some_and(|l| l.is_locked()))
+        (s.pointer, s.aim.is_some(), s.pointer_locked())
     };
     st.borrow_mut().pointer = pos;
     if aiming && !locked {
@@ -1170,6 +1299,9 @@ fn draw(s: &State, cr: &gtk::cairo::Context) {
         let _ = cr.fill();
         centered_text(cr, t, s.view.0 / 2.0, y + h / 2.0, size, 0.95);
     }
+    if s.menu {
+        draw_menu(s, cr);
+    }
 }
 
 /// Dibuja la capa en un PNG (para revisarla sin mirar la pantalla).
@@ -1244,9 +1376,9 @@ async fn run_script(st: St, path: String) {
             }
             "quit" => {
                 st.borrow_mut().lift_all();
-                let win = st.borrow().win.upgrade();
-                if let Some(w) = win {
-                    w.close();
+                let quit = st.borrow().quit.clone();
+                if let Some(q) = quit {
+                    q();
                 }
                 return;
             }
@@ -1294,14 +1426,18 @@ pub fn start(app: &adw::Application, pkg: String, profile: Profile, failed: impl
     let app = app.clone();
     glib::spawn_future_local(async move {
         let p = pkg.clone();
-        let link = gio::spawn_blocking(move || {
+        let ready = gio::spawn_blocking(move || {
             let link = Link::connect()?;
             // esperar a que el juego tenga ventana para quedar encima de ella
             for _ in 0..60 {
                 if link.running(&p) {
                     std::thread::sleep(Duration::from_millis(1500));
-                    let full = link.fullscreen(&p);
-                    return Ok((link, full));
+                    if !link.fullscreen(&p) {
+                        eprintln!("playnix: el juego no quedó en pantalla completa en Android");
+                    }
+                    // dentro de la ventana del juego, si libpnxh.so está
+                    let embed = Embed::connect(&p, Duration::from_secs(8));
+                    return Ok((link, embed));
                 }
                 std::thread::sleep(Duration::from_millis(500));
             }
@@ -1309,8 +1445,8 @@ pub fn start(app: &adw::Application, pkg: String, profile: Profile, failed: impl
         })
         .await
         .unwrap_or_else(|_| Err("error interno".into()));
-        let (link, full) = match link {
-            Ok((l, full)) => (Arc::new(l), full),
+        let (link, embed) = match ready {
+            Ok((l, e)) => (Arc::new(l), e),
             Err(e) => {
                 let _ = std::fs::remove_file(&mark);
                 failed(e);
@@ -1318,90 +1454,11 @@ pub fn start(app: &adw::Application, pkg: String, profile: Profile, failed: impl
                 return;
             }
         };
-
-        install_css();
-        let area = gtk::DrawingArea::new();
-        let win = gtk::ApplicationWindow::builder()
-            .application(&app)
-            .title(format!("{} · controles", crate::android::app_name(&pkg)))
-            .icon_name("playnix")
-            .decorated(false)
-            .child(&area)
-            .build();
-        win.add_css_class("playnix-controles");
-        win.remove_css_class("background");
         let empty = profile.widgets.is_empty();
-        let st: St = Rc::new(RefCell::new(State {
-            link: link.clone(),
-            pkg: pkg.clone(),
-            profile,
-            area: area.clone(),
-            win: win.downgrade(),
-            lock: None,
-            view: (1.0, 1.0),
-            mode: Mode::Play,
-            editor: Editor::default(),
-            taps: HashMap::new(),
-            fires: HashMap::new(),
-            pads: Vec::new(),
-            free: (0..10).rev().collect(),
-            held: HashSet::new(),
-            drag: None,
-            pinch: None,
-            aim: None,
-            pointer: (0.0, 0.0),
-            hints: !empty,
-            toast: None,
-            toast_gen: 0,
-        }));
-        st.borrow_mut().rebuild_pads();
-
-        let s = st.clone();
-        area.set_draw_func(move |_, cr, _, _| draw(&s.borrow(), cr));
-        let s = st.clone();
-        area.connect_resize(move |a, w, h| {
-            let mut s = s.borrow_mut();
-            s.view = (w.max(1) as f64, h.max(1) as f64);
-            // un perfil nuevo se guarda en las coordenadas de esta pantalla
-            if s.profile.widgets.is_empty() {
-                (s.profile.width, s.profile.height) = s.view;
-            }
-            a.queue_draw();
-        });
-        let events = gtk::EventControllerLegacy::new();
-        events.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let s = st.clone();
-        events.connect_event(move |_, ev| on_event(&s, ev));
-        win.add_controller(events);
-        let s = st.clone();
-        win.connect_close_request(move |_| {
-            s.borrow_mut().lift_all();
-            let _ = std::fs::remove_file(&mark);
-            glib::Propagation::Proceed
-        });
-        let actions = gio::SimpleActionGroup::new();
-        let action = |name: &str, f: Box<dyn Fn(&St)>| {
-            let a = gio::SimpleAction::new(name, None);
-            let s = st.clone();
-            a.connect_activate(move |_, _| f(&s));
-            actions.add_action(&a);
+        let st = match embed {
+            Some((embed, size, events)) => run_embedded(link.clone(), pkg.clone(), profile, embed, size, events, mark, hold),
+            None => run_window(&app, link.clone(), pkg.clone(), profile, mark, hold),
         };
-        action("edit", Box::new(|s| if s.borrow().mode == Mode::Play { edit_enter(s) } else { edit_exit(s) }));
-        action("hints", Box::new(|s| on_key(s, gdk::Key::F2, true, gdk::ModifierType::empty())));
-        action("help", Box::new(show_help));
-        action("close", Box::new(|s| {
-            if let Some(w) = s.borrow().win.upgrade() {
-                w.close();
-            }
-        }));
-        win.insert_action_group("ctl", Some(&actions));
-        // La capa ocupa lo mismo que la ventana del juego, que va maximizada
-        if !full {
-            eprintln!("playnix: el juego no quedó en pantalla completa en Android");
-        }
-        win.maximize();
-        win.present();
-        drop(hold);
 
         if empty {
             toast(&st, "Arrastra con el mouse · Shift + clic der. agranda · Shift + clic izq. encoge · ⋮ a la derecha: crear controles y ayuda", 7);
@@ -1413,13 +1470,14 @@ pub fn start(app: &adw::Application, pkg: String, profile: Profile, failed: impl
         }
 
         // Al cerrarse el juego se cierran los controles (y con ellos el servidor)
-        let w = win.downgrade();
+        let weak = Rc::downgrade(&st);
         glib::spawn_future_local(async move {
             let mut misses = 0;
             loop {
                 glib::timeout_future_seconds(2).await;
-                let Some(win) = w.upgrade() else { break };
+                let Some(st) = weak.upgrade() else { break };
                 let (l, p) = (link.clone(), pkg.clone());
+                drop(st);
                 let alive = gio::spawn_blocking(move || {
                     l.refresh_size();
                     l.running(&p)
@@ -1428,10 +1486,293 @@ pub fn start(app: &adw::Application, pkg: String, profile: Profile, failed: impl
                 .unwrap_or(true);
                 misses = if alive { 0 } else { misses + 1 };
                 if misses >= 2 {
-                    win.close();
+                    let quit = weak.upgrade().and_then(|st| st.borrow().quit.clone());
+                    if let Some(q) = quit {
+                        q();
+                    }
                     break;
                 }
             }
         });
     });
+}
+
+fn new_state(link: Arc<Link>, pkg: String, profile: Profile, area: Canvas) -> St {
+    let empty = profile.widgets.is_empty();
+    let st: St = Rc::new(RefCell::new(State {
+        link,
+        pkg,
+        profile,
+        area,
+        win: glib::WeakRef::new(),
+        lock: None,
+        embed: None,
+        locked: false,
+        claimed: None,
+        menu: false,
+        quit: None,
+        view: (1.0, 1.0),
+        mode: Mode::Play,
+        editor: Editor::default(),
+        taps: HashMap::new(),
+        fires: HashMap::new(),
+        pads: Vec::new(),
+        free: (0..10).rev().collect(),
+        held: HashSet::new(),
+        drag: None,
+        pinch: None,
+        aim: None,
+        pointer: (0.0, 0.0),
+        hints: !empty,
+        toast: None,
+        toast_gen: 0,
+    }));
+    st.borrow_mut().rebuild_pads();
+    st
+}
+
+fn resize(st: &St, w: f64, h: f64) {
+    let mut s = st.borrow_mut();
+    s.view = (w.max(1.0), h.max(1.0));
+    // un perfil nuevo se guarda en las coordenadas de esta pantalla
+    if s.profile.widgets.is_empty() {
+        (s.profile.width, s.profile.height) = s.view;
+    }
+    s.area.queue_draw();
+}
+
+// --- Dentro de la ventana del juego --------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn run_embedded(
+    link: Arc<Link>,
+    pkg: String,
+    profile: Profile,
+    embed: Embed,
+    size: (i32, i32),
+    events: async_channel::Receiver<embed::Ev>,
+    mark: std::path::PathBuf,
+    hold: gio::ApplicationHoldGuard,
+) -> St {
+    let canvas = Rc::new(EmbedCanvas::default());
+    let st = new_state(link, pkg, profile, Canvas::Embed(canvas.clone()));
+    let embed = Rc::new(embed);
+    st.borrow_mut().embed = Some(embed.clone());
+    let weak = Rc::downgrade(&st);
+    *canvas.render.borrow_mut() = Some(Box::new(move || {
+        if let Some(st) = weak.upgrade() {
+            render_embedded(&st);
+        }
+    }));
+    {
+        let e = embed.clone();
+        st.borrow_mut().quit = Some(Rc::new(move || e.close()));
+    }
+    resize(&st, size.0 as f64, size.1 as f64);
+    sync_keys(&st);
+
+    let st2 = st.clone();
+    glib::spawn_future_local(async move {
+        let st = st2;
+        let mut mods = gdk::ModifierType::empty();
+        while let Ok(ev) = events.recv().await {
+            use embed::Ev;
+            match ev {
+                Ev::Size(w, h) if w > 0 && h > 0 => resize(&st, w as f64, h as f64),
+                Ev::Size(..) | Ev::Gone => {}
+                Ev::Motion(x, y) => on_motion(&st, (x, y)),
+                Ev::Enter(x, y) => st.borrow_mut().pointer = (x, y),
+                Ev::Leave => {}
+                Ev::Button(b, pressed) => {
+                    let pos = st.borrow().pointer;
+                    on_button(&st, gtk_button(b), pressed, pos, mods);
+                }
+                Ev::Axis(axis, v) => {
+                    let d = v.signum();
+                    if axis == 0 { on_scroll(&st, 0.0, d, mods) } else { on_scroll(&st, d, 0.0, mods) }
+                }
+                Ev::Key(code, pressed) => {
+                    if let Some(k) = keyval_of(code) {
+                        on_key(&st, k, pressed, mods);
+                    }
+                }
+                Ev::Mods(dep, lat, lck) => mods = xkb_mods(dep | lat | lck),
+                Ev::Rel(dx, dy) => {
+                    if st.borrow().aim.is_some() {
+                        aim_move(&st, dx, dy);
+                    }
+                }
+                // al cambiar de ventana (Alt+Tab) no deben quedar dedos apoyados
+                Ev::Focus(false) => st.borrow_mut().lift_all(),
+                Ev::Focus(true) => {}
+            }
+            sync_keys(&st);
+        }
+        // se cerró la conexión: "Quitar controles", el juego se cerró o Android se apagó
+        st.borrow_mut().lift_all();
+        let _ = std::fs::remove_file(&mark);
+        drop(hold);
+    });
+    st
+}
+
+/// Dibuja la capa y se la manda al hwcomposer.
+fn render_embedded(st: &St) {
+    let s = st.borrow();
+    let Some(e) = s.embed.clone() else { return };
+    let (w, h) = (s.view.0.max(1.0) as i32, s.view.1.max(1.0) as i32);
+    let Ok(mut surface) = gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, w, h) else { return };
+    {
+        let Ok(cr) = gtk::cairo::Context::new(&surface) else { return };
+        draw(&s, &cr);
+    }
+    drop(s);
+    surface.flush();
+    let stride = surface.stride() as usize;
+    let Ok(data) = surface.data() else { return };
+    let row = w as usize * 4;
+    if stride == row {
+        e.frame(w as u32, h as u32, &data);
+    } else {
+        let packed: Vec<u8> = data.chunks(stride).flat_map(|r| &r[..row]).copied().collect();
+        e.frame(w as u32, h as u32, &packed);
+    }
+}
+
+/// Pide al hwcomposer las teclas que usa la capa; las demás van directo a Android.
+fn sync_keys(st: &St) {
+    let want = {
+        let s = st.borrow();
+        if s.embed.is_none() {
+            return;
+        }
+        if s.mode == Mode::Edit {
+            (true, Vec::new())
+        } else {
+            let mut keys = vec![gdk::Key::F1, gdk::Key::F2];
+            if s.aim.is_some() || s.menu {
+                keys.push(gdk::Key::Escape);
+            }
+            for w in &s.profile.widgets {
+                let list: Vec<&Vec<Key>> = match &w.kind {
+                    Kind::Tap(k) | Kind::Fire(k) => vec![k],
+                    Kind::Aim { keys, .. } => vec![keys],
+                    Kind::Pad { up, down, left, right, .. } => vec![up, down, left, right],
+                };
+                keys.extend(list.into_iter().flatten().filter_map(|k| match k {
+                    Key::Kb(k) => Some(*k),
+                    Key::Mouse(_) => None,
+                }));
+            }
+            let mut codes: Vec<u32> = keys.iter().flat_map(|k| keycodes_of(*k)).collect();
+            codes.sort_unstable();
+            codes.dedup();
+            (false, codes)
+        }
+    };
+    let mut s = st.borrow_mut();
+    if s.claimed.as_ref() != Some(&want) {
+        if let Some(e) = &s.embed {
+            e.keys(want.0, &want.1);
+        }
+        s.claimed = Some(want);
+    }
+}
+
+/// Códigos evdev de una tecla (según la distribución del teclado del escritorio).
+fn keycodes_of(k: gdk::Key) -> Vec<u32> {
+    let Some(display) = gdk::Display::default() else { return Vec::new() };
+    let mut codes = Vec::new();
+    for k in [k, k.to_upper(), k.to_lower()] {
+        if let Some(keys) = display.map_keyval(k) {
+            codes.extend(keys.iter().map(|k| k.keycode().saturating_sub(8)));
+        }
+    }
+    codes
+}
+
+fn keyval_of(code: u32) -> Option<gdk::Key> {
+    let keys = gdk::Display::default()?.map_keycode(code + 8)?;
+    keys.iter().find(|(k, _)| k.group() == 0 && k.level() == 0).or(keys.first()).map(|(_, v)| *v)
+}
+
+/// Modificadores de xkb (distribución estándar) → GTK.
+fn xkb_mods(m: u32) -> gdk::ModifierType {
+    let mut r = gdk::ModifierType::empty();
+    for (bit, gm) in [
+        (1, gdk::ModifierType::SHIFT_MASK),
+        (2, gdk::ModifierType::LOCK_MASK),
+        (4, gdk::ModifierType::CONTROL_MASK),
+        (8, gdk::ModifierType::ALT_MASK),
+        (0x40, gdk::ModifierType::SUPER_MASK),
+    ] {
+        if m & bit != 0 {
+            r |= gm;
+        }
+    }
+    r
+}
+
+/// Botón de Linux (BTN_LEFT = 0x110…) → numeración de GTK.
+fn gtk_button(b: u32) -> u32 {
+    match b {
+        0x110 => 1,
+        0x111 => 3,
+        0x112 => 2,
+        0x113 => 8,
+        0x114 => 9,
+        other => other.saturating_sub(0x10F),
+    }
+}
+
+// --- En una ventana aparte (sin libpnxh.so) -------------------------------------
+
+fn run_window(
+    app: &adw::Application,
+    link: Arc<Link>,
+    pkg: String,
+    profile: Profile,
+    mark: std::path::PathBuf,
+    hold: gio::ApplicationHoldGuard,
+) -> St {
+    install_css();
+    let area = gtk::DrawingArea::new();
+    let win = gtk::ApplicationWindow::builder()
+        .application(app)
+        .title(format!("{} · controles", crate::android::app_name(&pkg)))
+        .icon_name("playnix")
+        .decorated(false)
+        .child(&area)
+        .build();
+    win.add_css_class("playnix-controles");
+    win.remove_css_class("background");
+    let st = new_state(link, pkg, profile, Canvas::Area(area.clone()));
+    st.borrow_mut().win = win.downgrade();
+    let w = win.downgrade();
+    st.borrow_mut().quit = Some(Rc::new(move || {
+        if let Some(w) = w.upgrade() {
+            w.close();
+        }
+    }));
+
+    let s = st.clone();
+    area.set_draw_func(move |_, cr, _, _| draw(&s.borrow(), cr));
+    let s = st.clone();
+    area.connect_resize(move |_, w, h| resize(&s, w as f64, h as f64));
+    let events = gtk::EventControllerLegacy::new();
+    events.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let s = st.clone();
+    events.connect_event(move |_, ev| on_event(&s, ev));
+    win.add_controller(events);
+    let s = st.clone();
+    win.connect_close_request(move |_| {
+        s.borrow_mut().lift_all();
+        let _ = std::fs::remove_file(&mark);
+        glib::Propagation::Proceed
+    });
+    // La capa ocupa lo mismo que la ventana del juego, que va maximizada
+    win.maximize();
+    win.present();
+    drop(hold);
+    st
 }

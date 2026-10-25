@@ -51,8 +51,10 @@ Waydroid, Android y la traducción ARM los descarga e instala Playnix.
 
 ## Juegos: mouse y teclado
 
-Al abrir un juego, Playnix lo pone en pantalla completa y deja encima una capa
-invisible que convierte el mouse y el teclado en toques:
+Al abrir un juego, Playnix lo pone en pantalla completa y le agrega, dentro de su
+propia ventana, una capa invisible que convierte el mouse y el teclado en toques. El
+botón **⋮** del borde derecho tiene todo: editar controles, mostrar las teclas, la
+ayuda y quitar los controles.
 
 | Acción | En Android |
 |---|---|

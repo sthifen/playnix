@@ -2,6 +2,7 @@
 //! toques sobre la pantalla. `playnix open` pone la capa encima de los juegos (con
 //! o sin perfil: los gestos del mouse sirven siempre) y de las apps con perfil.
 
+mod embed;
 mod overlay;
 mod pointer;
 pub mod profile;
