@@ -265,6 +265,7 @@ static struct {
     int maximized, fullscreen;
     int gx, gy, gw, gh;  // geometría enviada (gw = 0: todavía no se conoce)
     int fixed;           // tamaño mínimo y máximo puestos
+    int full;            // la app ocupa toda la pantalla de Android (-1: no se sabe)
 } wins[WINDOWS];
 static unsigned next_win;
 // Ventana con el foco del teclado: la que se acaba de clicar
@@ -478,6 +479,7 @@ int wl_proxy_add_listener(struct wl_proxy *proxy, fnptr *impl, void *data) {
         wins[i].toplevel = 0;
         wins[i].maximized = wins[i].fullscreen = wins[i].fixed = 0;
         wins[i].gx = wins[i].gy = wins[i].gw = wins[i].gh = 0;
+        wins[i].full = -1;
     } else if (seq(cls, n, "xdg_toplevel")) {
         int i = -1;
         for (int k = 0; k < WINDOWS; k++) if (wins[k].window == data && !wins[k].toplevel) { i = k; break; }
@@ -486,6 +488,7 @@ int wl_proxy_add_listener(struct wl_proxy *proxy, fnptr *impl, void *data) {
             wins[i].window = data;
             wins[i].xdg_surface = 0;
             wins[i].fixed = wins[i].gw = 0;
+            wins[i].full = -1;
         }
         wins[i].toplevel = proxy;
         wins[i].maximized = wins[i].fullscreen = 0;
@@ -530,13 +533,6 @@ static void update_geometry(struct wl_proxy *surface, struct wl_proxy *region) {
     int w = regions[r].x1 - regions[r].x0 - 2 * INPUT_OUTSET;
     int h = regions[r].y1 - regions[r].y0 - 2 * INPUT_OUTSET;
     if (w <= 0 || h <= 0) return;
-    if (!wins[i].gw && wins[i].maximized && wins[i].toplevel) {
-        // la primera ventana, con la que Waydroid mide la pantalla, llega maximizada
-        wins[i].gw = w;
-        wins[i].gh = h;
-        if (!fills_display(i)) marshal(wins[i].toplevel, XDG_TOPLEVEL_UNSET_MAXIMIZED);
-        wins[i].gw = 0;
-    }
     if (x != wins[i].gx || y != wins[i].gy || w != wins[i].gw || h != wins[i].gh) {
         wins[i].gx = x;
         wins[i].gy = y;
@@ -545,7 +541,21 @@ static void update_geometry(struct wl_proxy *surface, struct wl_proxy *region) {
         marshal(wins[i].xdg_surface, XDG_SURFACE_SET_WINDOW_GEOMETRY, x, y, w, h);
         wins[i].fixed = -1; // hay que volver a poner el tamaño
     }
-    set_fixed(i, !wins[i].maximized && !wins[i].fullscreen);
+    // Si la app ocupa toda la pantalla de Android (un juego, o el botón □), la ventana
+    // se maximiza, como hacía Waydroid con todas: así la pantalla de Android coincide
+    // con la ventana (los controles de juegos dependen de eso). Si no, mide lo que
+    // la app. Waydroid no maximiza ni restaura por su cuenta.
+    int full = fills_display(i);
+    if (wins[i].toplevel && full != wins[i].full) {
+        wins[i].full = full;
+        if (full) {
+            set_fixed(i, 0);
+            if (!wins[i].maximized && !wins[i].fullscreen) marshal(wins[i].toplevel, XDG_TOPLEVEL_SET_MAXIMIZED);
+        } else if (wins[i].maximized) {
+            marshal(wins[i].toplevel, XDG_TOPLEVEL_UNSET_MAXIMIZED);
+        }
+    }
+    set_fixed(i, !full && !wins[i].maximized && !wins[i].fullscreen);
 }
 
 // Todas las peticiones de Waydroid pasan por aquí. Sus argumentos son enteros o

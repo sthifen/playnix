@@ -1,17 +1,17 @@
-//! Capa transparente encima del juego. En modo ventanas Waydroid abre cada app
-//! maximizada y del tamaño de la pantalla de Android, así que una ventana
+//! Capa transparente encima del juego. El juego ocupa toda la pantalla de Android
+//! y su ventana va maximizada (libpnxh.so, data/hwc-fix), así que una ventana
 //! maximizada encima coincide pixel por pixel: lo que se toca aquí se manda a
 //! Android en el mismo punto.
 //!
 //! Jugar: las teclas del perfil se convierten en toques; el clic izquierdo
 //! arrastra como un dedo; Shift + clic derecho/izquierdo hace el gesto de
 //! agrandar/encoger; el resto de teclas pasa a Android. F1 abre el editor y F2
-//! muestra u oculta las teclas.
+//! muestra u oculta las teclas; el botón ⋮ del borde derecho tiene todo eso.
 
 use super::pointer::PointerLock;
 use super::profile::{self, Key, Kind, Profile, Widget};
 use super::scrcpy::{self, Link};
-use gtk::prelude::*;
+use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -625,6 +625,57 @@ fn inside((x, y): (f64, f64), (rx, ry, rw, rh): (f64, f64, f64, f64)) -> bool {
     x >= rx && x <= rx + rw && y >= ry && y <= ry + rh
 }
 
+/// Botón ⋮ en el borde derecho, a media altura (las esquinas suelen tener botones
+/// del juego): abre el menú de los controles.
+fn menu_rect(view: (f64, f64)) -> (f64, f64, f64, f64) {
+    let (w, h) = (22.0, 54.0);
+    (view.0 - w, (view.1 - h) / 2.0, w, h)
+}
+
+fn open_menu(st: &St) {
+    let (area, view, edit) = {
+        let s = st.borrow();
+        (s.area.clone(), s.view, s.mode == Mode::Edit)
+    };
+    let menu = gio::Menu::new();
+    menu.append(Some(if edit { "Guardar controles" } else { "Editar controles (F1)" }), Some("ctl.edit"));
+    if !edit {
+        menu.append(Some("Mostrar u ocultar teclas (F2)"), Some("ctl.hints"));
+    }
+    menu.append(Some("Cómo se usa"), Some("ctl.help"));
+    menu.append(Some("Quitar controles"), Some("ctl.close"));
+    let pop = gtk::PopoverMenu::from_model(Some(&menu));
+    pop.set_parent(&area);
+    let (x, y, w, h) = menu_rect(view);
+    pop.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, w as i32, h as i32)));
+    pop.set_position(gtk::PositionType::Left);
+    pop.set_has_arrow(false);
+    pop.connect_closed(|p| {
+        let p = p.clone();
+        glib::idle_add_local_once(move || p.unparent());
+    });
+    pop.popup();
+}
+
+fn show_help(st: &St) {
+    let Some(win) = st.borrow().win.upgrade() else { return };
+    let body = "Jugar\n\
+        • Clic izquierdo y arrastrar: deslizar un dedo.\n\
+        • Shift + clic derecho: agrandar (dos dedos que se separan); mantenlo para seguir.\n\
+        • Shift + clic izquierdo: encoger.\n\
+        • Las teclas de tus controles tocan la pantalla por ti.\n\
+        • Esc suelta el mouse si quedó fijado para apuntar.\n\n\
+        Crear o cambiar controles (F1 o ⋮ → Editar)\n\
+        • Arriba aparece una barra: elige Botón, Joystick, Apuntar o Disparo.\n\
+        • Arrastra el control a su lugar sobre el juego; la rueda del mouse cambia su tamaño.\n\
+        • Con el control elegido, toca la tecla que quieres usar.\n\
+        • Guardar (o F1) termina. Cada juego guarda sus propios controles.\n\n\
+        F2 muestra u oculta las teclas sobre el juego.";
+    let dialog = adw::AlertDialog::new(Some("Controles del juego"), Some(body));
+    dialog.add_response("ok", "Entendido");
+    dialog.present(Some(&win));
+}
+
 fn edit_enter(st: &St) {
     {
         let mut s = st.borrow_mut();
@@ -847,6 +898,12 @@ fn on_key(st: &St, keyval: gdk::Key, pressed: bool, mods: gdk::ModifierType) {
 
 fn on_button(st: &St, button: u32, pressed: bool, pos: (f64, f64), mods: gdk::ModifierType) {
     st.borrow_mut().pointer = pos;
+    if button == 1 && inside(pos, menu_rect(st.borrow().view)) && st.borrow().drag.is_none() {
+        if pressed {
+            open_menu(st);
+        }
+        return;
+    }
     if st.borrow().mode == Mode::Edit {
         return edit_button(st, button, pressed, pos);
     }
@@ -923,6 +980,11 @@ fn on_scroll(st: &St, dx: f64, dy: f64, mods: gdk::ModifierType) {
 
 fn on_event(st: &St, ev: &gdk::Event) -> glib::Propagation {
     use gdk::EventType as E;
+    // el menú ⋮ y la ayuda tienen su propia superficie: sus eventos son para ellos
+    let own = st.borrow().win.upgrade().and_then(|w| w.surface());
+    if ev.surface().is_some() && ev.surface() != own {
+        return glib::Propagation::Proceed;
+    }
     match ev.event_type() {
         E::KeyPress | E::KeyRelease => {
             let Some(k) = ev.downcast_ref::<gdk::KeyEvent>() else { return glib::Propagation::Proceed };
@@ -1019,6 +1081,16 @@ fn draw(s: &State, cr: &gtk::cairo::Context) {
     if edit {
         cr.set_source_rgba(0.0, 0.0, 0.0, 0.38);
         let _ = cr.paint();
+    }
+    // botón ⋮: discreto, pegado al borde derecho
+    let (mx, my, mw, mh) = menu_rect(s.view);
+    rounded(cr, mx, my, mw + 10.0, mh, 9.0);
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.45);
+    let _ = cr.fill();
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.85);
+    for k in 0..3 {
+        cr.arc(mx + mw / 2.0, my + mh / 2.0 + (k as f64 - 1.0) * 9.0, 2.2, 0.0, 2.0 * std::f64::consts::PI);
+        let _ = cr.fill();
     }
     if s.hints || edit {
         for (i, w) in s.profile.widgets.iter().enumerate() {
@@ -1187,9 +1259,13 @@ async fn run_script(st: St, path: String) {
 
 fn install_css() {
     let css = gtk::CssProvider::new();
-    css.load_from_string("window.playnix-controles, window.playnix-controles > * { background: none; box-shadow: none; }");
+    // Por encima de la prioridad de usuario: un tema en ~/.config/gtk-4.0 le pondría
+    // fondo a la ventana y taparía el juego
+    css.load_from_string(
+        "window.playnix-controles, window.playnix-controles > * { background: none; background-color: transparent; box-shadow: none; }",
+    );
     if let Some(display) = gdk::Display::default() {
-        gtk::style_context_add_provider_for_display(&display, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
+        gtk::style_context_add_provider_for_display(&display, &css, gtk::STYLE_PROVIDER_PRIORITY_USER + 1);
     }
 }
 
@@ -1253,6 +1329,7 @@ pub fn start(app: &adw::Application, pkg: String, profile: Profile, failed: impl
             .child(&area)
             .build();
         win.add_css_class("playnix-controles");
+        win.remove_css_class("background");
         let empty = profile.widgets.is_empty();
         let st: St = Rc::new(RefCell::new(State {
             link: link.clone(),
@@ -1302,20 +1379,34 @@ pub fn start(app: &adw::Application, pkg: String, profile: Profile, failed: impl
             let _ = std::fs::remove_file(&mark);
             glib::Propagation::Proceed
         });
-        // La capa ocupa lo mismo que la ventana del juego: si Android lo tiene en
-        // pantalla completa, Waydroid también; si no, va maximizada.
-        if full {
-            win.fullscreen();
-        } else {
-            win.maximize();
+        let actions = gio::SimpleActionGroup::new();
+        let action = |name: &str, f: Box<dyn Fn(&St)>| {
+            let a = gio::SimpleAction::new(name, None);
+            let s = st.clone();
+            a.connect_activate(move |_, _| f(&s));
+            actions.add_action(&a);
+        };
+        action("edit", Box::new(|s| if s.borrow().mode == Mode::Play { edit_enter(s) } else { edit_exit(s) }));
+        action("hints", Box::new(|s| on_key(s, gdk::Key::F2, true, gdk::ModifierType::empty())));
+        action("help", Box::new(show_help));
+        action("close", Box::new(|s| {
+            if let Some(w) = s.borrow().win.upgrade() {
+                w.close();
+            }
+        }));
+        win.insert_action_group("ctl", Some(&actions));
+        // La capa ocupa lo mismo que la ventana del juego, que va maximizada
+        if !full {
+            eprintln!("playnix: el juego no quedó en pantalla completa en Android");
         }
+        win.maximize();
         win.present();
         drop(hold);
 
         if empty {
-            toast(&st, "Arrastra con el mouse · Shift + clic der. agranda · Shift + clic izq. encoge · F1 crea controles", 6);
+            toast(&st, "Arrastra con el mouse · Shift + clic der. agranda · Shift + clic izq. encoge · ⋮ a la derecha: crear controles y ayuda", 7);
         } else {
-            toast(&st, "Controles activos · F1 editar · F2 ver u ocultar teclas", HINTS_SECS);
+            toast(&st, "Controles activos · ⋮ a la derecha: editar, ver teclas y ayuda", HINTS_SECS);
         }
         if let Ok(path) = std::env::var("PLAYNIX_CONTROLS_SCRIPT") {
             glib::spawn_future_local(run_script(st.clone(), path));
