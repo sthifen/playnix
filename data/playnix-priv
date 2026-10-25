@@ -5,7 +5,60 @@
 set -euo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
+CFG=/var/lib/waydroid/waydroid.cfg
+MODE_FILE=/var/lib/playnix/gpu-mode   # auto | hw | sw (lo elige el usuario al instalar)
+
+driver_of() { basename "$(readlink -f "/sys/class/drm/$(basename "$1")/device/driver")"; }
+
+# hw si Android puede compartir buffers con el compositor, sw si no. Se mira qué GPU
+# tiene abierta el compositor AHORA (cambiar de GPU principal requiere cerrar sesión,
+# así que la configuración del sistema puede no coincidir con lo que está corriendo).
+gpu_detect() {
+    local mesa=0 d pid dev best="" n max=0
+    for d in /sys/class/drm/renderD*; do
+        case "$(driver_of "$d")" in i915|xe|amdgpu|radeon|nouveau|virtio*) mesa=1 ;; esac
+    done
+    [ "$mesa" = 1 ] || { echo sw; return; }
+    for pid in $(pgrep -x 'gnome-shell|kwin_wayland|Hyprland|sway|cosmic-comp|niri|wayfire|labwc|weston|river|mutter' || true); do
+        # el dispositivo con más descriptores abiertos es el que usa para dibujar
+        while read -r n dev; do
+            [ "$n" -gt "$max" ] && max=$n best=$dev
+        done < <(ls -l "/proc/$pid/fd" 2>/dev/null | grep -oE '/dev/dri/(renderD|card)[0-9]+' | sort | uniq -c)
+    done
+    if [ -n "$best" ]; then
+        [ "$(driver_of "$best")" = nvidia ] && echo sw || echo hw
+        return
+    fi
+    # sin compositor a la vista: reglas estáticas
+    for d in /sys/class/drm/card[0-9]; do
+        [ "$(driver_of "$d")" = nvidia ] && [ "$(cat "$d/device/boot_vga" 2>/dev/null)" = 1 ] && { echo sw; return; }
+    done
+    for f in /etc/udev/rules.d/*.rules; do
+        grep -qs 'mutter-device-preferred-primary' "$f" && grep -qs '0x10de' "$f" && { echo sw; return; }
+    done
+    echo hw
+}
+
+gpu_apply() {
+    local want=$1 have=hw
+    grep -q '^ro.hardware.egl = swiftshader' "$CFG" && have=sw
+    [ "$want" = "$have" ] && { echo "ok $have"; return; }
+    sed -i '/^ro.hardware.gralloc = default$/d; /^ro.hardware.egl = swiftshader$/d' "$CFG"
+    [ "$want" = sw ] && sed -i '/^\[properties\]/a ro.hardware.gralloc = default\nro.hardware.egl = swiftshader' "$CFG"
+    waydroid upgrade --offline >/dev/null 2>&1
+    echo "changed $want"
+}
+
 case "${1:-}" in
+    gpu-detect)
+        gpu_detect
+        ;;
+    gpu-auto)
+        # Solo con la sesión de Android apagada: `waydroid upgrade` reinicia el contenedor
+        mode=$(cat "$MODE_FILE" 2>/dev/null || echo auto)
+        [ "$mode" = auto ] && mode=$(gpu_detect)
+        gpu_apply "$mode"
+        ;;
     android-id)
         waydroid shell -- sh -c "sqlite3 /data/data/com.google.android.gsf/databases/gservices.db \"select value from main where name = 'android_id';\"" 2>/dev/null | tr -dc '0-9'
         ;;
@@ -41,7 +94,7 @@ case "${1:-}" in
             rm -rf "$d"'
         ;;
     *)
-        echo "uso: playnix-priv android-id|setup-android|restart-container|install-split" >&2
+        echo "uso: playnix-priv gpu-detect|gpu-auto|android-id|setup-android|restart-container|install-split" >&2
         exit 2
         ;;
 esac

@@ -157,7 +157,7 @@ pub fn install_desktop(fast_start: bool) -> Result<(), String> {
         &format!(
             "[Desktop Entry]\nType=Application\nName=Playnix\nComment=Android and Google Play settings\n\
              Comment[es]=Ajustes de Android y Google Play\nIcon=playnix\nExec={bin}\n\
-             Categories=System;Settings;\nKeywords=android;waydroid;google;play;\n"
+             Categories=Utility;\nKeywords=android;waydroid;google;play;\n"
         ),
     );
     write_if_changed(

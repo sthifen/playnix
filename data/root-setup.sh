@@ -120,30 +120,19 @@ fi
 
 # ---------------------------------------------------------------------------
 step gpu "Configurando gráficos"
-detectar_gpu() {
-    local mesa=0 nv=0 d drv
-    for d in /sys/class/drm/renderD*; do
-        drv=$(basename "$(readlink -f "$d/device/driver")")
-        case "$drv" in i915|xe|amdgpu|radeon|nouveau|virtio*) mesa=1 ;; esac
-    done
-    for d in /sys/class/drm/card[0-9]; do
-        drv=$(basename "$(readlink -f "$d/device/driver")")
-        [ "$drv" = nvidia ] && [ "$(cat "$d/device/boot_vga" 2>/dev/null)" = 1 ] && nv=1
-    done
-    for f in /etc/udev/rules.d/*.rules; do
-        grep -qs 'mutter-device-preferred-primary' "$f" && grep -qs '0x10de' "$f" && nv=1
-    done
-    if [ "$mesa" = 0 ] || [ "$nv" = 1 ]; then echo sw; else echo hw; fi
-}
-[ "$GPU" = auto ] && GPU=$(detectar_gpu)
-sed -i '/^ro.hardware.gralloc = default$/d; /^ro.hardware.egl = swiftshader$/d' "$CFG"
-if [ "$GPU" = sw ]; then
-    sed -i '/^\[properties\]/a ro.hardware.gralloc = default\nro.hardware.egl = swiftshader' "$CFG"
-    info "Modo compatible (tu GPU principal es NVIDIA): las apps se dibujan con la CPU"
+# La elección se guarda: "auto" hace que Playnix revise la GPU real cada vez que
+# arranca Android (playnix-priv gpu-auto), por si cambia sin reinstalar.
+mkdir -p /var/lib/playnix
+echo "$GPU" > /var/lib/playnix/gpu-mode
+modo=$GPU
+[ "$modo" = auto ] && modo=$(bash "$SRC_DIR/playnix-priv" gpu-detect)
+r=$(bash "$SRC_DIR/playnix-priv" gpu-auto)
+echo "@@LOG gpu-auto: $r"
+if [ "$modo" = sw ]; then
+    info "Modo compatible: tu escritorio usa una NVIDIA, las apps se dibujan con la CPU"
 else
     info "Aceleración por GPU activada"
 fi
-run waydroid upgrade --offline
 
 # ---------------------------------------------------------------------------
 step extras "Instalando compatibilidad con apps ARM"

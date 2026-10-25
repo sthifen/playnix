@@ -88,6 +88,8 @@ fn start_detached() {
 
 pub fn ensure_session(timeout: Duration) -> Res<()> {
     if !session_running() {
+        // Elegir el modo gráfico según la GPU que usa el escritorio en este momento
+        let _ = privileged("gpu-auto");
         start_detached();
     }
     let t0 = Instant::now();
@@ -99,6 +101,22 @@ pub fn ensure_session(timeout: Duration) -> Res<()> {
         sleep(Duration::from_millis(700));
     }
     Err("Android no terminó de arrancar".into())
+}
+
+/// true si Android está corriendo en un modo gráfico que no sirve para la GPU que usa
+/// el escritorio ahora mismo (p. ej. se cambió de GPU sin reiniciar Android).
+pub fn gpu_mismatch() -> bool {
+    let mode = std::fs::read_to_string("/var/lib/playnix/gpu-mode").unwrap_or_default();
+    let want = match mode.trim() {
+        "hw" | "sw" => mode.trim().to_string(),
+        _ => match privileged("gpu-detect") {
+            Ok(m) => m,
+            Err(_) => return false,
+        },
+    };
+    let cfg = std::fs::read_to_string("/var/lib/waydroid/waydroid.cfg").unwrap_or_default();
+    let have = if cfg.contains("ro.hardware.egl = swiftshader") { "sw" } else { "hw" };
+    want != have
 }
 
 pub fn stop_session() {
