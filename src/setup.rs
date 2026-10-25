@@ -12,6 +12,8 @@ use std::time::Duration;
 const ROOT_SETUP: &str = include_str!("../data/root-setup.sh");
 const PRIV_HELPER: &str = include_str!("../data/playnix-priv");
 const POLICY: &str = include_str!("../data/io.github.sthifen.playnix.policy");
+const HWC_SHIM: &[u8] = include_bytes!("../data/hwc-fix/libpnxh.so");
+const HWC_PATCH: &str = include_str!("../data/hwc-fix/hwc-patch.py");
 
 #[derive(Debug, Clone)]
 pub enum Ev {
@@ -44,9 +46,11 @@ fn stage_scripts() -> Res<PathBuf> {
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
     for (name, content, mode) in [
-        ("root-setup.sh", ROOT_SETUP, 0o755),
-        ("playnix-priv", PRIV_HELPER, 0o755),
-        ("io.github.sthifen.playnix.policy", POLICY, 0o644),
+        ("root-setup.sh", ROOT_SETUP.as_bytes(), 0o755),
+        ("playnix-priv", PRIV_HELPER.as_bytes(), 0o755),
+        ("io.github.sthifen.playnix.policy", POLICY.as_bytes(), 0o644),
+        ("libpnxh.so", HWC_SHIM, 0o644),
+        ("hwc-patch.py", HWC_PATCH.as_bytes(), 0o644),
     ] {
         let p = dir.join(name);
         std::fs::write(&p, content).map_err(|e| e.to_string())?;

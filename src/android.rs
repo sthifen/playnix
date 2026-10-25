@@ -90,6 +90,8 @@ pub fn ensure_session(timeout: Duration) -> Res<()> {
     if !session_running() {
         // Elegir el modo gráfico según la GPU que usa el escritorio en este momento
         let _ = privileged("gpu-auto");
+        // Juegos cuya capa de dibujo Waydroid descartaría (ventana transparente)
+        let _ = privileged("hwc-fix");
         start_detached();
     }
     let t0 = Instant::now();

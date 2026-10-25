@@ -42,11 +42,11 @@ USER_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
 step deps "Instalando componentes del sistema"
 . /etc/os-release
 falta=0
-for c in waydroid git lzip python3 wl-copy; do command -v "$c" >/dev/null || falta=1; done
+for c in waydroid git lzip python3 wl-copy debugfs; do command -v "$c" >/dev/null || falta=1; done
 if [ "$falta" = 1 ]; then
     info "Distribución: ${PRETTY_NAME:-$ID}"
     if command -v dnf >/dev/null; then
-        run dnf install -y waydroid git lzip python3 wl-clipboard || fail "dnf no pudo instalar los paquetes"
+        run dnf install -y waydroid git lzip python3 wl-clipboard e2fsprogs || fail "dnf no pudo instalar los paquetes"
     elif command -v rpm-ostree >/dev/null; then
         run rpm-ostree install -y --idempotent waydroid git lzip wl-clipboard || fail "rpm-ostree falló"
         fail "Se instalaron paquetes del sistema: reinicia la PC y vuelve a abrir Playnix."
@@ -56,15 +56,15 @@ if [ "$falta" = 1 ]; then
             curl -fsSL https://repo.waydro.id | bash 2>&1 | sed -u 's/^/@@LOG /'
         fi
         run apt-get update
-        run apt-get install -y waydroid git lzip python3 python3-venv wl-clipboard || fail "apt no pudo instalar los paquetes"
+        run apt-get install -y waydroid git lzip python3 python3-venv wl-clipboard e2fsprogs || fail "apt no pudo instalar los paquetes"
     elif command -v pacman >/dev/null; then
-        run pacman -S --needed --noconfirm git lzip python wl-clipboard || fail "pacman falló"
+        run pacman -S --needed --noconfirm git lzip python wl-clipboard e2fsprogs || fail "pacman falló"
         command -v waydroid >/dev/null || run pacman -S --needed --noconfirm waydroid ||
             fail "En Arch instala 'waydroid' desde AUR (yay -S waydroid) y vuelve a abrir Playnix."
     elif command -v zypper >/dev/null; then
-        run zypper -n install waydroid git lzip python3 wl-clipboard || fail "zypper falló"
+        run zypper -n install waydroid git lzip python3 wl-clipboard e2fsprogs || fail "zypper falló"
     elif command -v xbps-install >/dev/null; then
-        run xbps-install -Sy waydroid git lzip python3 wl-clipboard || fail "xbps falló"
+        run xbps-install -Sy waydroid git lzip python3 wl-clipboard e2fsprogs || fail "xbps falló"
     else
         fail "No sé instalar paquetes en esta distribución. Instala waydroid a mano: https://docs.waydro.id"
     fi
@@ -173,5 +173,8 @@ step helper "Integrando con el sistema"
 install -D -m 755 "$SRC_DIR/playnix-priv" "$LIBEXEC/playnix-priv"
 install -D -m 644 "$SRC_DIR/io.github.sthifen.playnix.policy" /usr/share/polkit-1/actions/io.github.sthifen.playnix.policy
 info "Ayudante de permisos instalado"
+install -D -m 644 "$SRC_DIR/libpnxh.so" "$LIBEXEC/libpnxh.so"
+install -D -m 644 "$SRC_DIR/hwc-patch.py" "$LIBEXEC/hwc-patch.py"
+echo "@@LOG hwc-fix: $("$LIBEXEC/playnix-priv" hwc-fix)"
 
 echo "@@DONE"

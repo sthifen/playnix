@@ -7,6 +7,10 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 CFG=/var/lib/waydroid/waydroid.cfg
 MODE_FILE=/var/lib/playnix/gpu-mode   # auto | hw | sw (lo elige el usuario al instalar)
+LIBEXEC=/usr/libexec/playnix
+HWC=lib64/hw/hwcomposer.waydroid.so
+OVL=/var/lib/waydroid/overlay/vendor
+HWC_STAMP=/var/lib/playnix/hwc-fix
 
 driver_of() { basename "$(readlink -f "/sys/class/drm/$(basename "$1")/device/driver")"; }
 
@@ -49,6 +53,39 @@ gpu_apply() {
     echo "changed $want"
 }
 
+# El hwcomposer de Waydroid descarta las capas cuyo nombre no lleva "TID:<tarea>#", y
+# a las SurfaceView solo se lo pone si su contexto es una Activity: juegos como Clash
+# Royale quedan con la ventana transparente. Se pone en el overlay una copia del
+# hwcomposer de la imagen actual que usa libpnxh.so para asignar esas capas a la
+# ventana de su app (ver data/hwc-fix). Se rehace si cambia la imagen de vendor, y si
+# la versión no es compatible se quita y Android queda como viene.
+hwc_unfix() { rm -f "$OVL/$HWC" "$OVL/lib64/libpnxh.so" "$HWC_STAMP"; }
+
+hwc_fix() {
+    local img tmp sum r
+    img="$(sed -n 's/^images_path = //p' "$CFG")/vendor.img"
+    if [ ! -f "$img" ] || ! command -v debugfs >/dev/null; then echo skip; return; fi
+    tmp=$(mktemp -d)
+    debugfs -R "dump /$HWC $tmp/orig.so" "$img" >/dev/null 2>&1 || true
+    if [ ! -s "$tmp/orig.so" ]; then
+        hwc_unfix; r=skip
+    else
+        sum=$(cat "$tmp/orig.so" "$LIBEXEC/libpnxh.so" "$LIBEXEC/hwc-patch.py" | sha256sum | cut -d' ' -f1)
+        if [ "$(cat "$HWC_STAMP" 2>/dev/null)" = "$sum" ] && [ -f "$OVL/$HWC" ]; then
+            r=ok
+        elif python3 -I "$LIBEXEC/hwc-patch.py" "$tmp/orig.so" "$tmp/patched.so"; then
+            install -D -m 644 "$tmp/patched.so" "$OVL/$HWC"
+            install -D -m 644 "$LIBEXEC/libpnxh.so" "$OVL/lib64/libpnxh.so"
+            echo "$sum" > "$HWC_STAMP"
+            r=changed
+        else
+            hwc_unfix; r=unsupported
+        fi
+    fi
+    rm -rf "$tmp"
+    echo "$r"
+}
+
 case "${1:-}" in
     gpu-detect)
         gpu_detect
@@ -58,6 +95,10 @@ case "${1:-}" in
         mode=$(cat "$MODE_FILE" 2>/dev/null || echo auto)
         [ "$mode" = auto ] && mode=$(gpu_detect)
         gpu_apply "$mode"
+        ;;
+    hwc-fix)
+        # Antes de arrancar Android: el overlay se monta al iniciar el contenedor
+        hwc_fix
         ;;
     android-id)
         waydroid shell -- sh -c "sqlite3 /data/data/com.google.android.gsf/databases/gservices.db \"select value from main where name = 'android_id';\"" 2>/dev/null | tr -dc '0-9'
@@ -94,7 +135,7 @@ case "${1:-}" in
             rm -rf "$d"'
         ;;
     *)
-        echo "uso: playnix-priv gpu-detect|gpu-auto|android-id|setup-android|restart-container|install-split" >&2
+        echo "uso: playnix-priv gpu-detect|gpu-auto|hwc-fix|android-id|setup-android|restart-container|install-split" >&2
         exit 2
         ;;
 esac
