@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Sin actividades: no aparece en el menú. Solo el proveedor de imágenes del
+     portapapeles; el servidor (Server.java) corre desde el mismo APK como shell. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="io.github.sthifen.playnix.clip">
+
+    <application android:label="Playnix" android:hasCode="true">
+        <provider
+            android:name=".ClipProvider"
+            android:authorities="io.github.sthifen.playnix.clip"
+            android:exported="true" />
+    </application>
+</manifest>

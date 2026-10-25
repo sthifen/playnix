@@ -29,12 +29,12 @@ pub struct Link {
     size: Mutex<(u32, u32)>,
 }
 
-fn adb(serial: &str, args: &[&str]) -> Option<String> {
+pub(crate) fn adb(serial: &str, args: &[&str]) -> Option<String> {
     let o = Command::new("adb").arg("-s").arg(serial).args(args).stderr(Stdio::null()).output().ok()?;
     o.status.success().then(|| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
-fn serial() -> Res<String> {
+pub(crate) fn serial() -> Res<String> {
     let out = Command::new("waydroid").arg("status").output().map_err(|e| e.to_string())?;
     String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -46,7 +46,7 @@ fn serial() -> Res<String> {
 
 /// Conecta adb y comprueba que Android lo autorizó; si no, le da la llave de esta
 /// PC con el ayudante de root y reintenta.
-fn connect_adb(serial: &str) -> Res<()> {
+pub(crate) fn connect_adb(serial: &str) -> Res<()> {
     for intento in 0..2 {
         for _ in 0..5 {
             android::unfreeze();
@@ -87,9 +87,7 @@ fn screen_size(serial: &str) -> Res<(u32, u32)> {
 }
 
 impl Link {
-    /// `clipboard`: que el servidor avise cada vez que cambia el portapapeles de
-    /// Android (mensajes que hay que leer con `reader`).
-    pub fn connect(clipboard: bool) -> Res<Link> {
+    pub fn connect() -> Res<Link> {
         let serial = serial()?;
         connect_adb(&serial)?;
         let size = screen_size(&serial)?;
@@ -111,7 +109,6 @@ impl Link {
             .args(["-s", &serial, "shell", &format!("CLASSPATH={DEVICE_JAR}"), "app_process", "/"])
             .args(["com.genymobile.scrcpy.Server", VERSION, &format!("scid={scid}"), "log_level=warn"])
             .args(["video=false", "audio=false", "control=true", "cleanup=false"])
-            .arg(format!("clipboard_autosync={clipboard}"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -193,28 +190,6 @@ impl Link {
         m.extend((bytes.len() as u32).to_be_bytes());
         m.extend(bytes);
         self.send(&m);
-    }
-
-    /// Pone texto en el portapapeles de Android (sin pegarlo).
-    pub fn set_clipboard(&self, text: &str) {
-        // límite del servidor: 256 KiB menos la cabecera del mensaje
-        let mut end = text.len().min((1 << 18) - 14);
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        let bytes = &text.as_bytes()[..end];
-        let mut m = Vec::with_capacity(14 + bytes.len());
-        m.push(9);
-        m.extend(0u64.to_be_bytes()); // sin acuse de recibo
-        m.push(0);
-        m.extend((bytes.len() as u32).to_be_bytes());
-        m.extend(bytes);
-        self.send(&m);
-    }
-
-    /// Otro extremo del mismo socket, para leer los mensajes que manda Android.
-    pub fn reader(&self) -> Res<TcpStream> {
-        self.stream.lock().map_err(|e| e.to_string())?.try_clone().map_err(|e| e.to_string())
     }
 
     /// Rueda del mouse en un punto (valores de -1 a 1 por paso).

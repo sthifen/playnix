@@ -11,11 +11,12 @@ como una máquina virtual:
 
 - **Google Play en tu menú.** Lo que instales aparece como un programa más; clic
   derecho → *Desinstalar*.
-- **Ventanas propias** para cada app, sin la pantalla de Android de fondo.
+- **Ventanas propias** para cada app, sin la pantalla de Android de fondo. Se mueven
+  arrastrando su barra de título, como cualquier ventana.
 - **Doble clic en un `.apk`** para instalarlo, con una ventana que te avisa.
 - **El teclado de tu PC** funciona en los campos de texto (sin teclado en pantalla).
-- **Portapapeles compartido**: lo que copias en Linux se pega en Android y al revés
-  (texto).
+- **Portapapeles compartido**: lo que copias en Linux se pega en Android y al revés,
+  texto e imágenes (capturas de pantalla, "Copiar imagen").
 - **Arranque sin esperas confusas**: si Android está apagado, ves "Abriendo…".
 - **Detección automática**: tipo de GPU, CPU (traducción ARM), Docker (red), distro.
 - **Certificación de Google Play** guiada: copia el código y abre la página por ti.
