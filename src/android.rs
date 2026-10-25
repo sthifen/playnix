@@ -49,6 +49,19 @@ pub fn session_running() -> bool {
     status().0 == "RUNNING"
 }
 
+/// Como `session_running`, pero sin lanzar `waydroid` (para revisarlo seguido):
+/// busca el proceso `waydroid session start` de este usuario.
+pub fn session_alive() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata("/proc/self").map(|m| m.uid()).ok();
+    std::fs::read_dir("/proc").into_iter().flatten().flatten().any(|p| {
+        let mine = std::fs::metadata(p.path()).is_ok_and(|m| Some(m.uid()) == uid);
+        let cmd = if mine { std::fs::read(p.path().join("cmdline")).unwrap_or_default() } else { Vec::new() };
+        let args: Vec<&[u8]> = cmd.split(|&b| b == 0).collect();
+        args.windows(3).any(|w| w[0].ends_with(b"waydroid") && w[1] == b"session" && w[2] == b"start")
+    })
+}
+
 /// Waydroid congela Android cuando no se usa; esto lo despierta (no requiere root).
 pub fn unfreeze() {
     if status().1 == "FROZEN" {

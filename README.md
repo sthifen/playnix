@@ -14,6 +14,8 @@ como una máquina virtual:
 - **Ventanas propias** para cada app, sin la pantalla de Android de fondo.
 - **Doble clic en un `.apk`** para instalarlo, con una ventana que te avisa.
 - **El teclado de tu PC** funciona en los campos de texto (sin teclado en pantalla).
+- **Portapapeles compartido**: lo que copias en Linux se pega en Android y al revés
+  (texto).
 - **Arranque sin esperas confusas**: si Android está apagado, ves "Abriendo…".
 - **Detección automática**: tipo de GPU, CPU (traducción ARM), Docker (red), distro.
 - **Certificación de Google Play** guiada: copia el código y abre la página por ti.
@@ -98,7 +100,7 @@ packaging/build-appimage.sh        # AppImage portable (usa podman/docker)
 ## Créditos
 
 Hecho sobre [Waydroid](https://github.com/waydroid/waydroid),
-[scrcpy](https://github.com/Genymobile/scrcpy) (su servidor inyecta los toques, Apache-2.0)
+[scrcpy](https://github.com/Genymobile/scrcpy) (su servidor inyecta los toques y sincroniza el portapapeles, Apache-2.0)
 y [waydroid_script](https://github.com/casualsnek/waydroid_script) (Widevine). El formato
 de los perfiles de controles es el de waydroid-helper. Tux fue creado por
 Larry Ewing con The GIMP; el robot de Android es de Google (CC BY 3.0). Playnix no está

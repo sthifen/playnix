@@ -7,6 +7,7 @@
 //!   playnix uninstall <paquete>  confirmar y desinstalar una app
 //!   playnix integrate            reaplicar la integración con el menú
 //!   playnix watchdog             reinicia Android si su pantalla se cae (servicio)
+//!   playnix clipboard            portapapeles compartido con Android (servicio)
 //!   playnix diagnose             resumen para reportar un problema
 //!   playnix controls <paquete> <perfil.json> | --gestos | --quitar
 //!                                controles de teclado para un juego
@@ -14,6 +15,7 @@
 mod android;
 mod apk;
 mod cli;
+mod clipboard;
 mod controls;
 mod integrate;
 mod setup;
@@ -154,6 +156,7 @@ fn main() -> gtk::glib::ExitCode {
             gtk::glib::ExitCode::SUCCESS
         }
         Some("watchdog") => integrate::watchdog(),
+        Some("clipboard") => clipboard::run(),
         Some("--version") => {
             println!("playnix {}", env!("CARGO_PKG_VERSION"));
             gtk::glib::ExitCode::SUCCESS

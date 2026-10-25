@@ -5,7 +5,7 @@
 mod overlay;
 mod pointer;
 pub mod profile;
-mod scrcpy;
+pub(crate) mod scrcpy;
 
 use crate::android::{self, Res};
 use std::path::{Path, PathBuf};

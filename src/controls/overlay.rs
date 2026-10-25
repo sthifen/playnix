@@ -1219,7 +1219,7 @@ pub fn start(app: &adw::Application, pkg: String, profile: Profile, failed: impl
     glib::spawn_future_local(async move {
         let p = pkg.clone();
         let link = gio::spawn_blocking(move || {
-            let link = Link::connect()?;
+            let link = Link::connect(false)?;
             // esperar a que el juego tenga ventana para quedar encima de ella
             for _ in 0..60 {
                 if link.running(&p) {

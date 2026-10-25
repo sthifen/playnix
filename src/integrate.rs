@@ -237,6 +237,14 @@ pub fn install_desktop(fast_start: bool) -> Result<(), String> {
              ExecStart={bin} watchdog\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n"
         ),
     );
+    write_if_changed(
+        &units.join("playnix-clipboard.service"),
+        &format!(
+            "[Unit]\nDescription=Playnix: shared clipboard with Android\nAfter=graphical-session.target\n\
+             PartOf=graphical-session.target\n\n[Service]\nExecStart={bin} clipboard\nRestart=on-failure\n\
+             RestartSec=10\n\n[Install]\nWantedBy=graphical-session.target\n"
+        ),
+    );
     let sc = |args: &[&str]| {
         let _ = Command::new("systemctl").arg("--user").args(args).status();
     };
@@ -244,6 +252,8 @@ pub fn install_desktop(fast_start: bool) -> Result<(), String> {
     sc(&["enable", "--now", "playnix-integrate.path"]);
     sc(&["enable", "playnix-watchdog.service"]);
     sc(&["restart", "playnix-watchdog.service"]);
+    sc(&["enable", "playnix-clipboard.service"]);
+    sc(&["restart", "playnix-clipboard.service"]);
     set_fast_start(fast_start);
     integrate()?;
     Ok(())

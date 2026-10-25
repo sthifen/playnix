@@ -51,6 +51,11 @@ fn pill(label: &str, suggested: bool) -> gtk::Button {
 /// Si Android ya está encendido abre la app al instante; si no, muestra una ventana
 /// "Abriendo…" mientras arranca, para que no parezca que no pasa nada.
 pub fn open(app: &adw::Application, pkg: String) {
+    // Por si el servicio no arrancó con la sesión (no hace nada si ya corre)
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "start", "--no-block", "playnix-clipboard.service"])
+        .stderr(std::process::Stdio::null())
+        .status();
     if android::session_running() && android::gpu_mismatch() {
         android::stop_session(); // se vuelve a arrancar abajo, ya en el modo correcto
     }
