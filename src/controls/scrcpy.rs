@@ -86,6 +86,53 @@ fn screen_size(serial: &str) -> Res<(u32, u32)> {
     size.ok_or_else(|| format!("tamaño de pantalla inesperado: {out}"))
 }
 
+/// Si la ventana de la app quedó fuera de la pantalla de Android (versiones anteriores
+/// dejaban que Android la arrastrara, y Android recuerda dónde estaba cada app), la
+/// vuelve adentro: si no, en Linux solo se ve una tira de la ventana.
+pub fn keep_on_screen(pkg: &str) {
+    let Ok(serial) = serial() else { return };
+    if connect_adb(&serial).is_err() {
+        return;
+    }
+    let Ok((sw, sh)) = screen_size(&serial) else { return };
+    let (sw, sh) = (sw as i64, sh as i64);
+    // "A=1000:com.android.settings.root" (afinidad de la tarea: el paquete y a veces más)
+    let (task, task_sub) = (format!(":{pkg} "), format!(":{pkg}."));
+    // la tarea tarda un momento en existir después de abrir la app
+    for _ in 0..10 {
+        let out = adb(&serial, &["shell", "dumpsys", "activity", "activities"]).unwrap_or_default();
+        let mut lines = out.lines();
+        let found = lines.by_ref().find(|l| l.contains("* Task{") && (l.contains(&task) || l.contains(&task_sub)));
+        let Some(head) = found else {
+            sleep(Duration::from_millis(500));
+            continue;
+        };
+        if !head.contains("mode=freeform") {
+            return;
+        }
+        let id = head.split_whitespace().find_map(|w| w.strip_prefix('#')).unwrap_or("");
+        // "    mBounds=Rect(375, 946 - 1357, 1629)"
+        let bounds: Vec<i64> = lines
+            .next()
+            .and_then(|l| l.trim().strip_prefix("mBounds=Rect("))
+            .map(|r| r.trim_end_matches(')').replace(" - ", ","))
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|n| n.trim().parse().ok())
+            .collect();
+        let [l, t, r, b] = bounds[..] else { return };
+        let (w, h) = ((r - l).min(sw), (b - t).min(sh));
+        let (nl, nt) = (l.clamp(0, sw - w), t.clamp(0, sh - h));
+        if (nl, nt, w, h) != (l, t, r - l, b - t) && !id.is_empty() {
+            let args = [nl, nt, nl + w, nt + h].map(|v| v.to_string());
+            let mut cmd = vec!["shell", "am", "task", "resize", id];
+            cmd.extend(args.iter().map(String::as_str));
+            let _ = adb(&serial, &cmd);
+        }
+        return;
+    }
+}
+
 impl Link {
     pub fn connect() -> Res<Link> {
         let serial = serial()?;

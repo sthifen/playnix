@@ -3,10 +3,10 @@
 Uso: python3 -I hwc-patch.py ORIGINAL SALIDA
 
 Dos cambios de datos, sin tocar código:
-1. split_layer_names_helper::split_layer_name y wl_proxy_add_listener pasan a enlace
-   local, así las llamadas por PLT se resuelven con las versiones de libpnxh.so (que
-   llaman a las originales). wl_proxy_add_listener es opcional: sin ella solo no se
-   pueden mover las ventanas desde la barra de Android.
+1. split_layer_names_helper::split_layer_name, wl_proxy_add_listener y
+   wl_proxy_marshal pasan a enlace local, así las llamadas por PLT se resuelven con las
+   versiones de libpnxh.so (que llaman a las originales). Las de Wayland son
+   opcionales (van juntas): sin ellas solo no se mueven bien las ventanas.
 2. El DT_NEEDED libsync.so se renombra a libpnxh.so (misma longitud); libpnxh.so a
    su vez depende de libsync.so, así que nada se pierde.
 
@@ -17,6 +17,7 @@ import sys
 
 SPLIT = b"_ZN24split_layer_names_helper16split_layer_nameERKNSt3__112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE"
 ADD_LISTENER = b"wl_proxy_add_listener"
+MARSHAL = b"wl_proxy_marshal"
 OLD, NEW = b"libsync.so", b"libpnxh.so"
 SHT_DYNSYM, SHT_DYNAMIC, DT_NEEDED, STB_LOCAL = 11, 6, 1, 0
 
@@ -42,7 +43,7 @@ def main(src, dst):
     def cstr(off):
         return bytes(b[stroff + off:b.index(0, stroff + off)])
 
-    names, hits = [], {SPLIT: [], ADD_LISTENER: []}
+    names, hits = [], {SPLIT: [], ADD_LISTENER: [], MARSHAL: []}
     for off in range(dynsym[4], dynsym[4] + dynsym[5], 24):
         st_name, st_info = struct.unpack_from("<IB", b, off)
         st_shndx, = struct.unpack_from("<H", b, off + 6)
@@ -51,7 +52,8 @@ def main(src, dst):
             hits[cstr(st_name)].append((off, st_info))
     if len(hits[SPLIT]) != 1:
         fail("no está split_layer_name")
-    for sym in (SPLIT, ADD_LISTENER):
+    wayland = (ADD_LISTENER, MARSHAL)
+    for sym in (SPLIT,) + (wayland if all(len(hits[w]) == 1 for w in wayland) else ()):
         if len(hits[sym]) == 1:
             off, st_info = hits[sym][0]
             b[off + 4] = (STB_LOCAL << 4) | (st_info & 0xF)

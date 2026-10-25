@@ -104,6 +104,15 @@ pub fn open(app: &adw::Application, pkg: String) {
 /// Pone la capa de controles encima de los juegos (con sus teclas si tienen perfil;
 /// sin perfil, los gestos del mouse) y de cualquier app con perfil.
 fn with_controls(app: &adw::Application, pkg: String) {
+    // `playnix open` termina cuando no queda nada pendiente: que espere a esto
+    let hold_screen = app.hold();
+    background(
+        {
+            let pkg = pkg.clone();
+            move || controls::keep_on_screen(&pkg)
+        },
+        move |()| drop(hold_screen),
+    );
     let profile = controls::load(&pkg);
     let hold = app.hold();
     let a = app.clone();

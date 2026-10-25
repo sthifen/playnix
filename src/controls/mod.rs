@@ -11,6 +11,7 @@ use crate::android::{self, Res};
 use std::path::{Path, PathBuf};
 
 pub use overlay::start;
+pub use scrcpy::keep_on_screen;
 
 fn dir() -> PathBuf {
     android::dirs_home().join(".local/share/playnix/controles")
