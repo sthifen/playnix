@@ -86,6 +86,22 @@ hwc_fix() {
     echo "$r"
 }
 
+# Docker (y firewalls como ufw) dejan la política FORWARD en DROP y Android no sale a
+# internet. Se acepta el tráfico de su interfaz al principio de FORWARD; Docker no
+# borra reglas ajenas, pero al reiniciar la máquina se pierden: se repite en cada
+# arranque de Android. No toca la configuración de Docker ni reinicia nada.
+net_fix() {
+    local r=ok dir
+    command -v iptables >/dev/null || { echo skip; return; }
+    [ "$(iptables -S FORWARD 2>/dev/null | head -1)" = "-P FORWARD ACCEPT" ] && { echo ok; return; }
+    for dir in -i -o; do
+        if ! iptables -C FORWARD "$dir" waydroid0 -j ACCEPT 2>/dev/null; then
+            iptables -I FORWARD 1 "$dir" waydroid0 -j ACCEPT 2>/dev/null && r=changed
+        fi
+    done
+    echo "$r"
+}
+
 case "${1:-}" in
     gpu-detect)
         gpu_detect
@@ -99,6 +115,9 @@ case "${1:-}" in
     hwc-fix)
         # Antes de arrancar Android: el overlay se monta al iniciar el contenedor
         hwc_fix
+        ;;
+    net-fix)
+        net_fix
         ;;
     adb-auth)
         # Controles de teclado: Android acepta la llave adb del usuario que llama.
@@ -145,7 +164,7 @@ case "${1:-}" in
             rm -rf "$d"'
         ;;
     *)
-        echo "uso: playnix-priv gpu-detect|gpu-auto|hwc-fix|adb-auth|android-id|setup-android|restart-container|install-split" >&2
+        echo "uso: playnix-priv gpu-detect|gpu-auto|hwc-fix|net-fix|adb-auth|android-id|setup-android|restart-container|install-split" >&2
         exit 2
         ;;
 esac

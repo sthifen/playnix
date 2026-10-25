@@ -80,20 +80,22 @@ if [ ! -e /dev/binderfs/binder ] && [ ! -e /dev/binder ]; then
         fail "Tu kernel no tiene 'binder', que Android necesita. Usa un kernel como linux-zen o xanmod."
 fi
 
-# Docker deja la política FORWARD en DROP: Android tendría DNS pero no internet.
-if systemctl is-active -q docker 2>/dev/null; then
-    if ! grep -qs '"ip-forward-no-drop": *true' /etc/docker/daemon.json; then
-        info "Docker detectado: dando internet a Android"
-        mkdir -p /etc/docker
-        python3 -I -c '
-import json, os
+# Versiones anteriores de Playnix escribían "ip-forward-no-drop" en la configuración de
+# Docker, que Docker anterior a la 28 no reconoce: no arrancaba. Se repara.
+if grep -qs '"ip-forward-no-drop"' /etc/docker/daemon.json && systemctl is-failed -q docker 2>/dev/null; then
+    python3 -I -c '
+import json
 p = "/etc/docker/daemon.json"
-d = json.load(open(p)) if os.path.exists(p) and os.path.getsize(p) else {}
-d["ip-forward-no-drop"] = True
+d = json.load(open(p))
+d.pop("ip-forward-no-drop", None)
 json.dump(d, open(p, "w"), indent=2)'
-        systemctl restart docker
-    fi
-    iptables -P FORWARD ACCEPT 2>/dev/null || true
+    systemctl restart docker && info "Docker reparado (una versión anterior de Playnix lo había detenido)"
+fi
+# Docker (y algunos firewalls) dejan la política FORWARD en DROP: Android tendría DNS
+# pero no internet. Se deja pasar solo el tráfico de Android, sin tocar Docker ni sus
+# contenedores; playnix-priv lo repite cada vez que arranca Android.
+if [ "$(bash "$SRC_DIR/playnix-priv" net-fix)" = changed ]; then
+    info "Firewall o Docker detectado: dando internet a Android"
 fi
 
 run systemctl enable --now waydroid-container || fail "No arrancó el servicio waydroid-container"
@@ -110,15 +112,44 @@ else
     fi
     # waydroid imprime "[Downloading]  12.85 MB/1191.2 MB  ..." con \r, primero la imagen
     # system (~86% del total) y luego vendor: lo convertimos en un solo porcentaje
-    waydroid init -f -s GAPPS -c "$OTA_SYSTEM" -v "$OTA_VENDOR" 2>&1 | tr '\r' '\n' | awk '
-        /\[Downloading\]/ { n = $2 + 0; split($3, b, "/"); t = b[2] + 0
-                            if (t > 0) { p = (fase <= 1) ? int(n * 86 / t) : 86 + int(n * 14 / t)
-                                         if (p != ult) { print "@@PROGRESS " p; ult = p; fflush() } }
-                            next }
-        /Downloading http/ { fase++; next }
-        /Validating|Extracting/ { sub(/^\[[0-9:]+\] /, ""); print "@@INFO " $0; fflush(); next }
-        NF { print "@@LOG " $0; fflush() }'
-    [ "${PIPESTATUS[0]}" = 0 ] || fail "No se pudo descargar Android. Revisa tu conexión e inténtalo de nuevo."
+    if ! python3 -I -c '
+import sys, urllib.request, urllib.error
+try:
+    urllib.request.urlopen(sys.argv[1], timeout=20)
+except urllib.error.HTTPError:
+    pass  # el servidor respondió
+' "$OTA_SYSTEM" >/dev/null 2>&1; then
+        fail "No hay conexión con el servidor de Android (ota.waydro.id). Revisa tu internet, VPN o firewall e inténtalo de nuevo."
+    fi
+    # waydroid descarga sin límite de tiempo: si la conexión se atasca espera para
+    # siempre (la instalación se quedaba pegada). Con 60 s sin recibir nada falla, y se
+    # reintenta.
+    waydroid_init() {
+        python3 -I -c '
+import os, socket, sys, runpy
+w = os.path.realpath("/usr/bin/waydroid")
+sys.path.insert(0, os.path.dirname(w))
+socket.setdefaulttimeout(60)
+sys.argv = ["waydroid"] + sys.argv[1:]
+runpy.run_path(w, run_name="__main__")
+' init -f -s GAPPS -c "$OTA_SYSTEM" -v "$OTA_VENDOR"
+    }
+    descargado=0
+    for intento in 1 2 3; do
+        [ "$intento" = 1 ] || info "La descarga se detuvo; reintentando ($intento de 3)…"
+        # waydroid imprime "[Downloading]  12.85 MB/1191.2 MB  ..." con \r, primero la
+        # imagen system (~86% del total) y luego vendor: un solo porcentaje
+        waydroid_init 2>&1 | tr '\r' '\n' | awk '
+            /\[Downloading\]/ { n = $2 + 0; split($3, b, "/"); t = b[2] + 0
+                                if (t > 0) { p = (fase <= 1) ? int(n * 86 / t) : 86 + int(n * 14 / t)
+                                             if (p != ult) { print "@@PROGRESS " p; ult = p; fflush() } }
+                                next }
+            /Downloading http/ { fase++; next }
+            /Validating|Extracting/ { sub(/^\[[0-9:]+\] /, ""); print "@@INFO " $0; fflush(); next }
+            NF { print "@@LOG " $0; fflush() }'
+        [ "${PIPESTATUS[0]}" = 0 ] && { descargado=1; break; }
+    done
+    [ "$descargado" = 1 ] || fail "No se pudo descargar Android: la conexión se cortó varias veces. Revisa tu internet e inténtalo de nuevo."
 fi
 
 # ---------------------------------------------------------------------------

@@ -105,6 +105,8 @@ pub fn ensure_session(timeout: Duration) -> Res<()> {
         let _ = privileged("gpu-auto");
         // Juegos cuya capa de dibujo Waydroid descartaría (ventana transparente)
         let _ = privileged("hwc-fix");
+        // Android sin internet si Docker o el firewall bloquean el reenvío
+        let _ = privileged("net-fix");
         start_detached();
     }
     let t0 = Instant::now();
