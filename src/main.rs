@@ -6,6 +6,7 @@
 //!   playnix install-apk <apk>    ventana para instalar un APK
 //!   playnix uninstall <paquete>  confirmar y desinstalar una app
 //!   playnix integrate            reaplicar la integración con el menú
+//!   playnix watchdog             reinicia Android si su pantalla se cae (servicio)
 
 mod android;
 mod apk;
@@ -76,7 +77,10 @@ fn main() -> gtk::glib::ExitCode {
                 gtk::glib::ExitCode::FAILURE
             }
         },
-        Some("apk-info") => match apk::read(std::path::Path::new(&arg(1))) {
+        Some("apk-info") => match {
+            let p = PathBuf::from(arg(1));
+            if apk::is_bundle(&p) { apk::read_bundle(&p) } else { apk::read(&p) }
+        } {
             Some(i) => {
                 println!("paquete: {}\nversión: {}\nnombre:  {}", i.package, i.version, i.label);
                 gtk::glib::ExitCode::SUCCESS
@@ -86,6 +90,7 @@ fn main() -> gtk::glib::ExitCode {
                 gtk::glib::ExitCode::FAILURE
             }
         },
+        Some("watchdog") => integrate::watchdog(),
         Some("--version") => {
             println!("playnix {}", env!("CARGO_PKG_VERSION"));
             gtk::glib::ExitCode::SUCCESS

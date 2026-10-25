@@ -152,22 +152,31 @@ if [ "$ARM" = auto ]; then
         GenuineIntel) ARM=houdini ;; *) ARM=ndk ;;
     esac
 fi
-extras=()
-if grep -q 'native.bridge = lib' "$CFG"; then
-    info "La traducción ARM ya estaba instalada"
-elif [ "$ARM" != none ]; then
+# libhoudini es más compatible en Intel y libndk en AMD: si está la que no toca, se cambia
+actual=$(sed -n 's/^ro.dalvik.vm.native.bridge = lib\(houdini\|ndk_translation\)\.so$/\1/p' "$CFG" | head -1)
+[ "$actual" = ndk_translation ] && actual=ndk
+extras=() quitar=()
+if [ "$ARM" = none ] || [ "$actual" = "$ARM" ]; then
+    [ -n "$actual" ] && info "Traducción ARM: lib$actual"
+else
+    [ -n "$actual" ] && quitar+=("lib$actual") && info "Cambiando lib$actual por lib$ARM (mejor para tu CPU)"
     extras+=("lib$ARM")
 fi
-[ "$WIDEVINE" = 1 ] && extras+=(widevine)
-if [ ${#extras[@]} -gt 0 ]; then
+[ "$WIDEVINE" = 1 ] && ! grep -q widevine "$CFG" && extras+=(widevine)
+if [ ${#extras[@]} -gt 0 ] || [ ${#quitar[@]} -gt 0 ]; then
     mkdir -p "$(dirname "$WS_DIR")"
     [ -d "$WS_DIR/.git" ] || run git clone -q --depth 1 https://github.com/casualsnek/waydroid_script "$WS_DIR" ||
         fail "No se pudo descargar waydroid_script"
     run git -C "$WS_DIR" pull -q --ff-only || true
     [ -x "$WS_DIR/venv/bin/python3" ] || run python3 -m venv "$WS_DIR/venv" || fail "No se pudo crear el entorno de Python"
     run "$WS_DIR/venv/bin/pip" install -q -r "$WS_DIR/requirements.txt" || fail "No se pudieron instalar dependencias de Python"
-    info "Instalando: ${extras[*]}"
-    run "$WS_DIR/venv/bin/python3" "$WS_DIR/main.py" -a 13 install "${extras[@]}" || fail "Falló la instalación de ${extras[*]}"
+    if [ ${#quitar[@]} -gt 0 ]; then
+        run "$WS_DIR/venv/bin/python3" "$WS_DIR/main.py" -a 13 uninstall "${quitar[@]}" || fail "No se pudo quitar ${quitar[*]}"
+    fi
+    if [ ${#extras[@]} -gt 0 ]; then
+        info "Instalando: ${extras[*]}"
+        run "$WS_DIR/venv/bin/python3" "$WS_DIR/main.py" -a 13 install "${extras[@]}" || fail "Falló la instalación de ${extras[*]}"
+    fi
 fi
 
 # ---------------------------------------------------------------------------

@@ -29,6 +29,25 @@ const HIDDEN: &[&str] = &[
 
 const ICON_SVG: &str = include_str!("../data/playnix.svg");
 
+const MIME_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-xapk">
+    <comment>Android app bundle</comment>
+    <comment xml:lang="es">Paquete de app de Android</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.xapk" weight="90"/>
+    <icon name="playnix"/>
+  </mime-type>
+  <mime-type type="application/x-apks">
+    <comment>Android split app bundle</comment>
+    <comment xml:lang="es">Paquete de app de Android</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.apks" weight="90"/>
+    <icon name="playnix"/>
+  </mime-type>
+</mime-info>
+"#;
+
 fn apps_dir() -> PathBuf {
     dirs_home().join(".local/share/applications")
 }
@@ -145,16 +164,23 @@ pub fn install_desktop(fast_start: bool) -> Result<(), String> {
         &dir.join("io.github.sthifen.Playnix.InstallApk.desktop"),
         &format!(
             "[Desktop Entry]\nType=Application\nName=Install Android app\nName[es]=Instalar app de Android\n\
-             Icon=playnix\nExec={bin} install-apk %F\nMimeType=application/vnd.android.package-archive;\n\
+             Icon=playnix\nExec={bin} install-apk %F\n\
+             MimeType=application/vnd.android.package-archive;application/x-xapk;application/x-apks;\n\
              NoDisplay=true\n"
         ),
     );
+    // .xapk y .apks son ZIP: sin esto el escritorio los abriría como archivos comprimidos
+    let mime = dirs_home().join(".local/share/mime");
+    std::fs::create_dir_all(mime.join("packages")).map_err(|e| e.to_string())?;
+    if write_if_changed(&mime.join("packages/io.github.sthifen.Playnix.xml"), MIME_XML) {
+        let _ = Command::new("update-mime-database").arg(&mime).status();
+    }
     // Restos de la versión anterior basada en scripts
     let _ = std::fs::remove_file(dir.join("wd-install-apk.desktop"));
     let _ = Command::new("update-desktop-database").arg(&dir).status();
-    let _ = Command::new("xdg-mime")
-        .args(["default", "io.github.sthifen.Playnix.InstallApk.desktop", "application/vnd.android.package-archive"])
-        .status();
+    for t in ["application/vnd.android.package-archive", "application/x-xapk", "application/x-apks"] {
+        let _ = Command::new("xdg-mime").args(["default", "io.github.sthifen.Playnix.InstallApk.desktop", t]).status();
+    }
 
     let units = dirs_home().join(".config/systemd/user");
     std::fs::create_dir_all(&units).map_err(|e| e.to_string())?;
@@ -173,11 +199,20 @@ pub fn install_desktop(fast_start: bool) -> Result<(), String> {
          PartOf=graphical-session.target\n\n[Service]\nExecStart=/usr/bin/waydroid session start\n\
          ExecStop=/usr/bin/waydroid session stop\n\n[Install]\nWantedBy=graphical-session.target\n",
     );
+    write_if_changed(
+        &units.join("playnix-watchdog.service"),
+        &format!(
+            "[Unit]\nDescription=Playnix: recover Android if its display crashes\n\n[Service]\n\
+             ExecStart={bin} watchdog\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n"
+        ),
+    );
     let sc = |args: &[&str]| {
         let _ = Command::new("systemctl").arg("--user").args(args).status();
     };
     sc(&["daemon-reload"]);
     sc(&["enable", "--now", "playnix-integrate.path"]);
+    sc(&["enable", "playnix-watchdog.service"]);
+    sc(&["restart", "playnix-watchdog.service"]);
     set_fast_start(fast_start);
     integrate()?;
     Ok(())
@@ -195,4 +230,57 @@ pub fn set_fast_start(on: bool) {
     let _ = Command::new("systemctl")
         .args(["--user", if on { "enable" } else { "disable" }, "playnix-session.service"])
         .status();
+}
+
+// ---------------------------------------------------------------------------
+// Vigilante: si la pantalla de Android (hwcomposer/surfaceflinger) se cae, todas las
+// ventanas desaparecen y Android no vuelve a dibujar hasta reiniciar la sesión.
+
+pub fn watchdog() -> ! {
+    use std::io::{BufRead, BufReader};
+    use std::time::{Duration, Instant};
+    let mut last: Option<Instant> = None;
+    loop {
+        // systemd-coredump deja una línea por cada proceso de Android que muere
+        let child = Command::new("journalctl")
+            .args(["--user", "-f", "-n", "0", "-o", "cat", "-t", "systemd-coredump"])
+            .stdout(std::process::Stdio::piped())
+            .spawn();
+        let Ok(mut child) = child else {
+            std::thread::sleep(Duration::from_secs(30));
+            continue;
+        };
+        let out = child.stdout.take().unwrap();
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            let display_died = line.contains("(composer@2.1-se)") || line.contains("(surfaceflinger)");
+            if !display_died || last.is_some_and(|t| t.elapsed() < Duration::from_secs(30)) {
+                continue;
+            }
+            last = Some(Instant::now());
+            recover();
+        }
+        let _ = child.wait();
+        std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
+fn recover() {
+    use crate::android;
+    let _ = Command::new("notify-send")
+        .args(["-a", "Playnix", "-i", "playnix", "Reiniciando Android",
+               "Una app hizo fallar la pantalla de Android. Se arreglará en unos segundos."])
+        .status();
+    android::stop_session();
+    match android::ensure_session(std::time::Duration::from_secs(150)) {
+        Ok(()) => {
+            let _ = Command::new("notify-send")
+                .args(["-a", "Playnix", "-i", "playnix", "Android listo", "Ya puedes volver a abrir tus apps."])
+                .status();
+        }
+        Err(_) => {
+            let _ = Command::new("notify-send")
+                .args(["-a", "Playnix", "-i", "playnix", "Android no pudo reiniciarse", "Abre Playnix para repararlo."])
+                .status();
+        }
+    }
 }

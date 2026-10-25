@@ -16,8 +16,32 @@ case "${1:-}" in
     restart-container)
         systemctl restart waydroid-container
         ;;
+    install-split)
+        # Instala una app partida (.xapk/.apks) que Playnix dejó en /data/waydroid_tmp/playnix-split:
+        # todos los .apk en una sola sesión de instalación, y los OBB a su carpeta.
+        waydroid shell -- sh -c '
+            d=/data/waydroid_tmp/playnix-split
+            total=0
+            for f in "$d"/*.apk; do total=$((total + $(stat -c %s "$f"))); done
+            sid=$(pm install-create -S "$total" | sed -n "s/.*\[\([0-9]*\)\].*/\1/p")
+            [ -n "$sid" ] || { rm -rf "$d"; exit 1; }
+            i=0
+            for f in "$d"/*.apk; do
+                pm install-write -S "$(stat -c %s "$f")" "$sid" "split$i" "$f" >/dev/null || { pm install-abandon "$sid"; rm -rf "$d"; exit 1; }
+                i=$((i + 1))
+            done
+            pm install-commit "$sid" || { rm -rf "$d"; exit 1; }
+            if [ -d "$d/obb" ]; then
+                for p in "$d"/obb/*; do
+                    dst=/data/media/0/Android/obb/$(basename "$p")
+                    mkdir -p "$dst" && cp -r "$p"/. "$dst"/
+                done
+                chown -R media_rw:media_rw /data/media/0/Android/obb 2>/dev/null
+            fi
+            rm -rf "$d"'
+        ;;
     *)
-        echo "uso: playnix-priv android-id|setup-android|restart-container" >&2
+        echo "uso: playnix-priv android-id|setup-android|restart-container|install-split" >&2
         exit 2
         ;;
 esac

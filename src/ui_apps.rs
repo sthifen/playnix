@@ -92,7 +92,8 @@ pub fn open(app: &adw::Application, pkg: String) {
 
 pub fn install_apk(app: &adw::Application, files: Vec<PathBuf>) {
     let Some(file) = files.into_iter().next() else { return };
-    let info = apk::read(&file);
+    let bundle = apk::is_bundle(&file);
+    let info = if bundle { apk::read_bundle(&file) } else { apk::read(&file) };
     let name = info
         .as_ref()
         .filter(|i| !i.label.is_empty())
@@ -107,7 +108,7 @@ pub fn install_apk(app: &adw::Application, files: Vec<PathBuf>) {
 
     let Some(info) = info else {
         page.set_icon_name(Some("dialog-error-symbolic"));
-        page.set_description(Some("Este archivo no es un APK válido."));
+        page.set_description(Some("Este archivo no es una app de Android válida."));
         page.set_child(None::<&gtk::Widget>);
         win.present();
         return;
@@ -132,7 +133,11 @@ pub fn install_apk(app: &adw::Application, files: Vec<PathBuf>) {
                 let pkg = pkg.clone();
                 move || {
                     android::ensure_session(Duration::from_secs(150))?;
-                    android::install_apk(&file, &pkg)
+                    if bundle {
+                        android::install_bundle(&file, &pkg)
+                    } else {
+                        android::install_apk(&file, &pkg)
+                    }
                 }
             },
             move |r| match r {

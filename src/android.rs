@@ -173,6 +173,25 @@ pub fn install_apk(path: &Path, pkg: &str) -> Res<bool> {
     Err("La app no apareció después de instalar. Puede que no sea compatible con este Android.".into())
 }
 
+/// Instala una app partida (.xapk/.apks): extrae sus partes en la carpeta temporal
+/// que Android ve como /data/waydroid_tmp y las instala en una sola sesión.
+pub fn install_bundle(path: &Path, pkg: &str) -> Res<bool> {
+    let previo = has_app(pkg);
+    let dir = dirs_home().join(".local/share/waydroid/data/waydroid_tmp/playnix-split");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let r = crate::apk::extract_bundle(path, &dir).and_then(|_| privileged("install-split"));
+    let _ = std::fs::remove_dir_all(&dir);
+    r.map_err(|_| "Android rechazó la app. Puede que no sea compatible con este equipo.".to_string())?;
+    for _ in 0..30 {
+        if has_app(pkg) {
+            return Ok(previo);
+        }
+        sleep(Duration::from_secs(1));
+    }
+    Err("La app no apareció después de instalar.".into())
+}
+
 pub fn remove_app(pkg: &str) -> Res<()> {
     if quiet("waydroid", &["app", "remove", pkg]) {
         Ok(())

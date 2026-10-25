@@ -175,3 +175,81 @@ pub fn pretty_filename(path: &Path) -> String {
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     stem.replace(['_', '-', '.'], " ").split_whitespace().collect::<Vec<_>>().join(" ")
 }
+
+// ---------------------------------------------------------------------------
+// Apps partidas: .xapk (APKPure, Uptodown…) y .apks (SAI, bundletool)
+
+pub fn is_bundle(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref(),
+        Some("xapk" | "apks")
+    )
+}
+
+/// Lee los datos de un paquete partido: manifest.json si lo trae; si no, el base.apk.
+pub fn read_bundle(path: &Path) -> Option<ApkInfo> {
+    const PY: &str = r#"
+import json, sys, tempfile, zipfile
+z = zipfile.ZipFile(sys.argv[1])
+names = z.namelist()
+if "manifest.json" in names:
+    m = json.loads(z.read("manifest.json"))
+    print(m.get("package_name", ""), m.get("version_name", ""), m.get("name", ""), "", sep="\t")
+else:
+    apks = [n for n in names if n.endswith(".apk")]
+    base = "base.apk" if "base.apk" in names else (apks[0] if apks else None)
+    if base is None:
+        sys.exit(1)
+    t = tempfile.NamedTemporaryFile(suffix=".apk", delete=False)
+    t.write(z.read(base))
+    print("", "", "", t.name, sep="\t")
+"#;
+    let out = std::process::Command::new("python3").args(["-I", "-c", PY]).arg(path).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&out.stdout).trim_end_matches('\n').to_string();
+    let mut f = line.split('\t');
+    let (pkg, ver, name, tmp) = (f.next()?, f.next()?, f.next()?, f.next().unwrap_or(""));
+    if !tmp.is_empty() {
+        let info = read(Path::new(tmp));
+        let _ = std::fs::remove_file(tmp);
+        return info;
+    }
+    (!pkg.is_empty()).then(|| ApkInfo { package: pkg.into(), version: ver.into(), label: name.into() })
+}
+
+/// Extrae los .apk (y los OBB) de un paquete partido en `dest`.
+pub fn extract_bundle(path: &Path, dest: &Path) -> Result<usize, String> {
+    const PY: &str = r#"
+import os, shutil, sys, zipfile
+z, dest = zipfile.ZipFile(sys.argv[1]), sys.argv[2]
+n = 0
+for info in z.infolist():
+    name = info.filename
+    if info.is_dir() or ".." in name.split("/"):
+        continue
+    if name.endswith(".apk"):
+        out = os.path.join(dest, "%02d-%s" % (n, os.path.basename(name)))
+        n += 1
+    elif name.startswith("Android/obb/") and name.endswith(".obb"):
+        out = os.path.join(dest, "obb", *name.split("/")[2:])
+    else:
+        continue
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with z.open(info) as s, open(out, "wb") as d:
+        shutil.copyfileobj(s, d, 1 << 20)
+print(n)
+"#;
+    let out = std::process::Command::new("python3")
+        .args(["-I", "-c", PY])
+        .arg(path)
+        .arg(dest)
+        .output()
+        .map_err(|e| e.to_string())?;
+    let n: usize = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0);
+    if !out.status.success() || n == 0 {
+        return Err("El archivo no contiene ninguna app".into());
+    }
+    Ok(n)
+}
