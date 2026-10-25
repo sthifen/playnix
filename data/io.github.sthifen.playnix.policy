@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Playnix</vendor>
+  <vendor_url>https://github.com/sthifen/playnix</vendor_url>
+  <action id="io.github.sthifen.playnix.priv">
+    <description>Run Playnix maintenance actions on Android</description>
+    <description xml:lang="es">Ejecutar acciones de mantenimiento de Android de Playnix</description>
+    <message>Playnix needs to access Android</message>
+    <message xml:lang="es">Playnix necesita acceder a Android</message>
+    <icon_name>playnix</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/playnix/playnix-priv</annotate>
+  </action>
+</policyconfig>

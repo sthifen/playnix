@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- Playnix: Tux con antenas de Android. Plano: azul marino, blanco y un acento verde. -->
+  <rect x="6" y="6" width="116" height="116" rx="28" fill="#f4f6f9"/>
+  <rect x="6.5" y="6.5" width="115" height="115" rx="27.5" fill="none" stroke="#1b2130" stroke-opacity=".08"/>
+
+  <!-- antenas -->
+  <g stroke="#2bc46e" stroke-width="5" stroke-linecap="round">
+    <path d="M53 30 L46 17"/>
+    <path d="M75 30 L82 17"/>
+  </g>
+
+  <!-- pies -->
+  <path d="M34 108 C34 101 44 99 52 102 C56 104 56 110 50 111 L38 111 C35 111 34 110 34 108 Z" fill="#1b2130"/>
+  <path d="M94 108 C94 101 84 99 76 102 C72 104 72 110 78 111 L90 111 C93 111 94 110 94 108 Z" fill="#1b2130"/>
+
+  <!-- aletas -->
+  <path d="M33 66 C24 74 22 90 27 98 C31 92 34 80 37 72 Z" fill="#1b2130"/>
+  <path d="M95 66 C104 74 106 90 101 98 C97 92 94 80 91 72 Z" fill="#1b2130"/>
+
+  <!-- cuerpo y cabeza -->
+  <path d="M64 24 C80 24 88 36 88 50 C88 58 94 66 96 78 C99 96 87 106 64 106 C41 106 29 96 32 78 C34 66 40 58 40 50 C40 36 48 24 64 24 Z" fill="#1b2130"/>
+
+  <!-- cara y barriga -->
+  <path d="M64 56 C79 56 85 70 85 83 C85 96 77 101 64 101 C51 101 43 96 43 83 C43 70 49 56 64 56 Z" fill="#ffffff"/>
+  <path d="M59 72 L75 81.5 L59 91 Z" fill="#2bc46e" stroke="#2bc46e" stroke-width="3" stroke-linejoin="round"/>
+
+  <!-- ojos -->
+  <ellipse cx="56" cy="40" rx="5" ry="6" fill="#ffffff"/>
+  <ellipse cx="72" cy="40" rx="5" ry="6" fill="#ffffff"/>
+  <circle cx="57" cy="41.5" r="2.4" fill="#1b2130"/>
+  <circle cx="71" cy="41.5" r="2.4" fill="#1b2130"/>
+
+  <!-- pico -->
+  <path d="M57.5 48 L70.5 48 L64 54 Z" fill="#f2b233" stroke="#f2b233" stroke-width="2.5" stroke-linejoin="round"/>
+</svg>
