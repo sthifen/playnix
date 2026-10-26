@@ -107,11 +107,15 @@ pub fn install_self() -> Result<(), String> {
     Ok(())
 }
 
+/// Escribe con archivo temporal + rename, como Waydroid. Escrito encima, GNOME a veces
+/// se quedaba con la versión de Waydroid (`waydroid app launch` directo): esa arranca
+/// Android mostrando su pantalla completa y se salta todo lo de Playnix.
 fn write_if_changed(path: &Path, content: &str) -> bool {
     if std::fs::read_to_string(path).ok().as_deref() == Some(content) {
         return false;
     }
-    std::fs::write(path, content).is_ok()
+    let tmp = path.with_extension("playnix-tmp");
+    std::fs::write(&tmp, content).is_ok() && std::fs::rename(&tmp, path).is_ok()
 }
 
 /// Ajusta un .desktop generado por Waydroid. Devuelve true si lo modificó.
@@ -276,11 +280,15 @@ pub fn set_fast_start(on: bool) {
 // ---------------------------------------------------------------------------
 // Vigilante: si la pantalla de Android (hwcomposer/surfaceflinger) se cae, todas las
 // ventanas desaparecen y Android no vuelve a dibujar hasta reiniciar la sesión.
+// Si se cuelga en vez de caerse, system_server no puede arrancar y Android se reinicia
+// en bucle (cada ~36 s) sin que ninguna app abra.
+
+static LAST_RECOVERY: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
 pub fn watchdog() -> ! {
     use std::io::{BufRead, BufReader};
-    use std::time::{Duration, Instant};
-    let mut last: Option<Instant> = None;
+    use std::time::Duration;
+    std::thread::spawn(watch_hangs);
     loop {
         // systemd-coredump deja una línea por cada proceso de Android que muere
         let child = Command::new("journalctl")
@@ -294,15 +302,58 @@ pub fn watchdog() -> ! {
         let out = child.stdout.take().unwrap();
         for line in BufReader::new(out).lines().map_while(Result::ok) {
             let display_died = line.contains("(composer@2.1-se)") || line.contains("(surfaceflinger)");
-            if !display_died || last.is_some_and(|t| t.elapsed() < Duration::from_secs(30)) {
-                continue;
+            if display_died {
+                recover_once();
             }
-            last = Some(Instant::now());
-            recover();
         }
         let _ = child.wait();
         std::thread::sleep(Duration::from_secs(5));
     }
+}
+
+/// El watchdog de Android deja un informe en /data/anr ("Subject: Blocked in …") cada
+/// vez que reinicia system_server. Dos seguidos en 3 minutos: está en bucle.
+fn watch_hangs() {
+    use std::time::{Duration, SystemTime};
+    let dir = dirs_home().join(".local/share/waydroid/data/anr");
+    let mut seen = SystemTime::now();
+    let mut recent: Vec<SystemTime> = Vec::new();
+    loop {
+        std::thread::sleep(Duration::from_secs(10));
+        let mut newest = seen;
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let Ok(t) = e.metadata().and_then(|m| m.modified()) else { continue };
+            if t <= seen || !e.file_name().to_string_lossy().starts_with("anr_") {
+                continue;
+            }
+            newest = newest.max(t);
+            let mut head = [0u8; 64];
+            let n = std::fs::File::open(e.path()).and_then(|mut f| std::io::Read::read(&mut f, &mut head)).unwrap_or(0);
+            if head[..n].starts_with(b"Subject: Blocked in") {
+                recent.push(t);
+            }
+        }
+        seen = newest;
+        recent.retain(|t| t.elapsed().is_ok_and(|d| d < Duration::from_secs(180)));
+        if recent.len() >= 2 {
+            recent.clear();
+            recover_once();
+            // los informes que deje el apagado no cuentan
+            seen = SystemTime::now();
+        }
+    }
+}
+
+fn recover_once() {
+    use std::time::{Duration, Instant};
+    {
+        let mut last = LAST_RECOVERY.lock().unwrap();
+        if last.is_some_and(|t| t.elapsed() < Duration::from_secs(30)) {
+            return;
+        }
+        *last = Some(Instant::now());
+    }
+    recover();
 }
 
 fn recover() {
