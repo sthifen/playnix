@@ -122,11 +122,45 @@ except urllib.error.HTTPError:
         fail "No hay conexión con el servidor de Android (ota.waydro.id). Revisa tu internet, VPN o firewall e inténtalo de nuevo."
     fi
     # waydroid descarga sin límite de tiempo: si la conexión se atasca espera para
-    # siempre (la instalación se quedaba pegada). Con 60 s sin recibir nada falla, y se
-    # reintenta.
+    # siempre. Con 60 s sin recibir nada falla, y se reintenta. Su salida se interpreta
+    # aquí mismo y sin búfer: por una tubería (tr, awk) el progreso llegaba todo al
+    # final y la instalación parecía congelada. Imprime "[Downloading] 12.85 MB/1191.2
+    # MB ..." con \r, primero la imagen system (~86% del total) y luego vendor.
     waydroid_init() {
         python3 -I -c '
-import os, socket, sys, runpy
+import os, re, socket, sys, runpy
+
+real = sys.__stdout__
+def emit(text):
+    real.write(text + "\n")
+    real.flush()
+
+class Out:
+    buf, fase, ult = "", 0, -1
+    def write(self, text):
+        *lines, self.buf = re.split(r"[\r\n]", self.buf + text)
+        for line in lines:
+            self.line(line)
+        return len(text)
+    def flush(self):
+        pass
+    def line(self, line):
+        m = re.search(r"\[Downloading\]\s+([\d.]+) MB/([\d.]+) MB", line)
+        if m:
+            n, t = float(m[1]), float(m[2])
+            if t > 0:
+                p = int(n * 86 / t) if self.fase <= 1 else 86 + int(n * 14 / t)
+                if p != self.ult:
+                    emit("@@PROGRESS %d" % p)
+                    self.ult = p
+        elif "Downloading http" in line:
+            self.fase += 1
+        elif "Validating" in line or "Extracting" in line:
+            emit("@@INFO " + re.sub(r"^\[[0-9:]+\] ", "", line))
+        elif line.strip():
+            emit("@@LOG " + line)
+
+sys.stdout = sys.stderr = Out()
 w = os.path.realpath("/usr/bin/waydroid")
 sys.path.insert(0, os.path.dirname(w))
 socket.setdefaulttimeout(60)
@@ -137,17 +171,7 @@ runpy.run_path(w, run_name="__main__")
     descargado=0
     for intento in 1 2 3; do
         [ "$intento" = 1 ] || info "La descarga se detuvo; reintentando ($intento de 3)…"
-        # waydroid imprime "[Downloading]  12.85 MB/1191.2 MB  ..." con \r, primero la
-        # imagen system (~86% del total) y luego vendor: un solo porcentaje
-        waydroid_init 2>&1 | tr '\r' '\n' | awk '
-            /\[Downloading\]/ { n = $2 + 0; split($3, b, "/"); t = b[2] + 0
-                                if (t > 0) { p = (fase <= 1) ? int(n * 86 / t) : 86 + int(n * 14 / t)
-                                             if (p != ult) { print "@@PROGRESS " p; ult = p; fflush() } }
-                                next }
-            /Downloading http/ { fase++; next }
-            /Validating|Extracting/ { sub(/^\[[0-9:]+\] /, ""); print "@@INFO " $0; fflush(); next }
-            NF { print "@@LOG " $0; fflush() }'
-        [ "${PIPESTATUS[0]}" = 0 ] && { descargado=1; break; }
+        waydroid_init && { descargado=1; break; }
     done
     [ "$descargado" = 1 ] || fail "No se pudo descargar Android: la conexión se cortó varias veces. Revisa tu internet e inténtalo de nuevo."
 fi
