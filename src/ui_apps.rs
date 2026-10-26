@@ -101,8 +101,8 @@ pub fn open(app: &adw::Application, pkg: String) {
     );
 }
 
-/// Pone la capa de controles encima de los juegos (con sus teclas si tienen perfil;
-/// sin perfil, los gestos del mouse) y de cualquier app con perfil.
+/// Pone la capa de controles en todas las apps: con sus teclas si tienen perfil y si
+/// no, los gestos del mouse y el menú ⋮ para crear controles.
 fn with_controls(app: &adw::Application, pkg: String) {
     // `playnix open` termina cuando no queda nada pendiente: que espere a esto
     let hold_screen = app.hold();
@@ -119,20 +119,18 @@ fn with_controls(app: &adw::Application, pkg: String) {
     background(
         {
             let pkg = pkg.clone();
-            move || profile.or_else(|| controls::is_game(&pkg).then(controls::profile::Profile::empty))
+            move || (profile.unwrap_or_else(controls::profile::Profile::empty), controls::is_game(&pkg))
         },
-        move |profile| {
+        move |(profile, game)| {
             drop(hold);
-            if let Some(profile) = profile {
-                start_controls(&a, pkg, profile);
-            }
+            start_controls(&a, pkg, profile, game);
         },
     );
 }
 
-fn start_controls(app: &adw::Application, pkg: String, profile: controls::profile::Profile) {
+fn start_controls(app: &adw::Application, pkg: String, profile: controls::profile::Profile, game: bool) {
     let a = app.clone();
-    controls::start(app, pkg.clone(), profile, move |e| {
+    controls::start(app, pkg.clone(), profile, game, move |e| {
         let page = adw::StatusPage::builder()
             .icon_name("input-keyboard-symbolic")
             .title("Los controles de teclado no se activaron")

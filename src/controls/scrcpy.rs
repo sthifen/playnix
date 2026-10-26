@@ -27,6 +27,9 @@ pub struct Link {
     /// Tamaño de la pantalla de Android, en píxeles. Waydroid lo cambia cuando su
     /// ventana cambia de tamaño (p. ej. al pasar a pantalla completa).
     size: Mutex<(u32, u32)>,
+    /// Dónde está la app en la pantalla de Android (izq., arriba, ancho, alto) si va
+    /// en ventana flotante; None si ocupa toda la pantalla.
+    area: Mutex<Option<(f64, f64, f64, f64)>>,
 }
 
 pub(crate) fn adb(serial: &str, args: &[&str]) -> Option<String> {
@@ -96,41 +99,52 @@ pub fn keep_on_screen(pkg: &str) {
     }
     let Ok((sw, sh)) = screen_size(&serial) else { return };
     let (sw, sh) = (sw as i64, sh as i64);
-    // "A=1000:com.android.settings.root" (afinidad de la tarea: el paquete y a veces más)
-    let (task, task_sub) = (format!(":{pkg} "), format!(":{pkg}."));
     // la tarea tarda un momento en existir después de abrir la app
     for _ in 0..10 {
-        let out = adb(&serial, &["shell", "dumpsys", "activity", "activities"]).unwrap_or_default();
-        let mut lines = out.lines();
-        let found = lines.by_ref().find(|l| l.contains("* Task{") && (l.contains(&task) || l.contains(&task_sub)));
-        let Some(head) = found else {
+        let Some(task) = task(&serial, pkg) else {
             sleep(Duration::from_millis(500));
             continue;
         };
-        if !head.contains("mode=freeform") {
+        if task.mode != "freeform" {
             return;
         }
-        let id = head.split_whitespace().find_map(|w| w.strip_prefix('#')).unwrap_or("");
-        // "    mBounds=Rect(375, 946 - 1357, 1629)"
-        let bounds: Vec<i64> = lines
-            .next()
-            .and_then(|l| l.trim().strip_prefix("mBounds=Rect("))
-            .map(|r| r.trim_end_matches(')').replace(" - ", ","))
-            .unwrap_or_default()
-            .split(',')
-            .filter_map(|n| n.trim().parse().ok())
-            .collect();
-        let [l, t, r, b] = bounds[..] else { return };
+        let Some([l, t, r, b]) = task.bounds else { return };
         let (w, h) = ((r - l).min(sw), (b - t).min(sh));
         let (nl, nt) = (l.clamp(0, sw - w), t.clamp(0, sh - h));
-        if (nl, nt, w, h) != (l, t, r - l, b - t) && !id.is_empty() {
+        if (nl, nt, w, h) != (l, t, r - l, b - t) && !task.id.is_empty() {
             let args = [nl, nt, nl + w, nt + h].map(|v| v.to_string());
-            let mut cmd = vec!["shell", "am", "task", "resize", id];
+            let mut cmd = vec!["shell", "am", "task", "resize", &task.id];
             cmd.extend(args.iter().map(String::as_str));
             let _ = adb(&serial, &cmd);
         }
         return;
     }
+}
+
+struct Task {
+    id: String,
+    mode: String,
+    bounds: Option<[i64; 4]>,
+}
+
+/// La tarea de la app según `dumpsys activity activities`.
+fn task(serial: &str, pkg: &str) -> Option<Task> {
+    let out = adb(serial, &["shell", "dumpsys", "activity", "activities"])?;
+    // "A=1000:com.android.settings.root" (afinidad de la tarea: el paquete y a veces más)
+    let (affinity, affinity_sub) = (format!(":{pkg} "), format!(":{pkg}."));
+    let mut lines = out.lines();
+    let head = lines.find(|l| l.contains("* Task{") && (l.contains(&affinity) || l.contains(&affinity_sub)))?;
+    let word = |prefix: &str| head.split_whitespace().find_map(|w| w.strip_prefix(prefix)).unwrap_or("").to_string();
+    // "    mBounds=Rect(375, 946 - 1357, 1629)"
+    let bounds: Vec<i64> = lines
+        .next()
+        .and_then(|l| l.trim().strip_prefix("mBounds=Rect("))
+        .map(|r| r.trim_end_matches(')').replace(" - ", ","))
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|n| n.trim().parse().ok())
+        .collect();
+    Some(Task { id: word("#"), mode: word("mode="), bounds: bounds.try_into().ok() })
 }
 
 impl Link {
@@ -178,7 +192,7 @@ impl Link {
         // Primero manda el nombre del dispositivo (64 bytes)
         let mut meta = [0u8; 64];
         stream.read_exact(&mut meta).map_err(|e| e.to_string())?;
-        Ok(Link { serial, socket, stream: Mutex::new(stream), server, size: Mutex::new(size) })
+        Ok(Link { serial, socket, stream: Mutex::new(stream), server, size: Mutex::new(size), area: Mutex::new(None) })
     }
 
     fn send(&self, msg: &[u8]) {
@@ -191,13 +205,22 @@ impl Link {
         self.size.lock().map(|s| *s).unwrap_or((1920, 1080))
     }
 
-    /// Vuelve a leer el tamaño de la pantalla de Android.
-    pub fn refresh_size(&self) {
+    /// Vuelve a leer el tamaño de la pantalla de Android y dónde está la app.
+    pub fn refresh_size(&self, pkg: &str) {
         if let Ok(size) = screen_size(&self.serial) {
             if let Ok(mut s) = self.size.lock() {
                 *s = size;
             }
         }
+        let area = task(&self.serial, pkg).filter(|t| t.mode == "freeform").and_then(|t| t.bounds);
+        if let Ok(mut a) = self.area.lock() {
+            *a = area.map(|[l, t, r, b]| (l as f64, t as f64, (r - l) as f64, (b - t) as f64));
+        }
+    }
+
+    /// Ver `area`.
+    pub fn area(&self) -> Option<(f64, f64, f64, f64)> {
+        self.area.lock().ok().and_then(|a| *a)
     }
 
     /// Toque en píxeles de Android. `id` distingue los dedos (multitáctil).
@@ -259,14 +282,7 @@ impl Link {
     /// completa con F11 (atajo de Waydroid): los controles necesitan el juego entero.
     /// Devuelve si el juego quedó en pantalla completa.
     pub fn fullscreen(&self, pkg: &str) -> bool {
-        let mode = || {
-            let out = adb(&self.serial, &["shell", "dumpsys", "activity", "activities"]).unwrap_or_default();
-            let task = format!(":{pkg} ");
-            out.lines()
-                .find(|l| l.contains("* Task{") && l.contains(&task))
-                .and_then(|l| l.split_whitespace().find_map(|w| w.strip_prefix("mode=")).map(str::to_string))
-                .unwrap_or_default()
-        };
+        let mode = || task(&self.serial, pkg).map(|t| t.mode).unwrap_or_default();
         if mode() != "freeform" {
             return mode() == "fullscreen";
         }

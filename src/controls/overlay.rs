@@ -176,10 +176,13 @@ impl State {
         (x * self.profile.width / self.view.0, y * self.profile.height / self.view.1)
     }
 
-    /// capa → Android
+    /// capa → Android (la capa cubre la app: toda la pantalla o su ventana flotante)
     fn to_android(&self, (x, y): (f64, f64)) -> (f64, f64) {
-        let (aw, ah) = self.link.size();
-        (x * aw as f64 / self.view.0, y * ah as f64 / self.view.1)
+        let (l, t, w, h) = self.link.area().unwrap_or_else(|| {
+            let (aw, ah) = self.link.size();
+            (0.0, 0.0, aw as f64, ah as f64)
+        });
+        (l + x * w / self.view.0, t + y * h / self.view.1)
     }
 
     fn touch_profile(&self, action: u8, id: u64, p: (f64, f64)) {
@@ -1420,7 +1423,8 @@ fn claim(pkg: &str) -> Option<std::path::PathBuf> {
 
 /// Activa los controles sobre la app `pkg` (ya lanzada). `failed` recibe el error
 /// si no se pudo conectar; el juego sigue abierto igual.
-pub fn start(app: &adw::Application, pkg: String, profile: Profile, failed: impl FnOnce(String) + 'static) {
+/// `game`: se pasa a pantalla completa. Las demás apps conservan su ventana.
+pub fn start(app: &adw::Application, pkg: String, profile: Profile, game: bool, failed: impl FnOnce(String) + 'static) {
     let Some(mark) = claim(&pkg) else { return };
     let hold = app.hold();
     let app = app.clone();
@@ -1428,20 +1432,21 @@ pub fn start(app: &adw::Application, pkg: String, profile: Profile, failed: impl
         let p = pkg.clone();
         let ready = gio::spawn_blocking(move || {
             let link = Link::connect()?;
-            // esperar a que el juego tenga ventana para quedar encima de ella
+            // esperar a que la app tenga ventana para quedar encima de ella
             for _ in 0..60 {
                 if link.running(&p) {
                     std::thread::sleep(Duration::from_millis(1500));
-                    if !link.fullscreen(&p) {
+                    if game && !link.fullscreen(&p) {
                         eprintln!("playnix: el juego no quedó en pantalla completa en Android");
                     }
+                    link.refresh_size(&p);
                     // dentro de la ventana del juego, si libpnxh.so está
                     let embed = Embed::connect(&p, Duration::from_secs(8));
                     return Ok((link, embed));
                 }
                 std::thread::sleep(Duration::from_millis(500));
             }
-            Err("el juego no arrancó".to_string())
+            Err("la app no arrancó".to_string())
         })
         .await
         .unwrap_or_else(|_| Err("error interno".into()));
@@ -1457,6 +1462,11 @@ pub fn start(app: &adw::Application, pkg: String, profile: Profile, failed: impl
         let empty = profile.widgets.is_empty();
         let st = match embed {
             Some((embed, size, events)) => run_embedded(link.clone(), pkg.clone(), profile, embed, size, events, mark, hold),
+            // la ventana aparte va maximizada: solo coincide con apps en pantalla completa
+            None if !game && link.area().is_some() => {
+                let _ = std::fs::remove_file(&mark);
+                return;
+            }
             None => run_window(&app, link.clone(), pkg.clone(), profile, mark, hold),
         };
 
@@ -1479,7 +1489,7 @@ pub fn start(app: &adw::Application, pkg: String, profile: Profile, failed: impl
                 let (l, p) = (link.clone(), pkg.clone());
                 drop(st);
                 let alive = gio::spawn_blocking(move || {
-                    l.refresh_size();
+                    l.refresh_size(&p);
                     l.running(&p)
                 })
                 .await

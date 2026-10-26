@@ -1,6 +1,6 @@
 //! Controles de teclado y mouse para juegos: un perfil por app convierte teclas en
-//! toques sobre la pantalla. `playnix open` pone la capa encima de los juegos (con
-//! o sin perfil: los gestos del mouse sirven siempre) y de las apps con perfil.
+//! toques sobre la pantalla. `playnix open` pone la capa en todas las apps (con o
+//! sin perfil: los gestos del mouse sirven siempre); los juegos van en pantalla completa.
 
 mod embed;
 mod overlay;
